@@ -3,7 +3,11 @@ import PackageDescription
 
 /// Settings to be passed to swiftc for all targets.
 let allTargetsSwiftSettings: [SwiftSetting] = [
-  .unsafeFlags(["-warnings-as-errors"])
+  .unsafeFlags(["-warnings-as-errors"]),
+]
+
+let concurrentSafeSettings = allTargetsSwiftSettings + [
+  .unsafeFlags(["-strict-concurrency=complete", "-warn-concurrency"]),
 ]
 
 let package = Package(
@@ -81,7 +85,7 @@ let package = Package(
         .product(name: "Durian", package: "Durian"),
         .product(name: "BigInt", package: "BigInt"),
       ],
-      swiftSettings: allTargetsSwiftSettings),
+      swiftSettings: concurrentSafeSettings),
 
     .target(
       name: "Core",
@@ -90,7 +94,7 @@ let package = Package(
         .product(name: "Collections", package: "swift-collections"),
         .product(name: "LLVM", package: "Swifty-LLVM"),
       ],
-      swiftSettings: allTargetsSwiftSettings),
+      swiftSettings: concurrentSafeSettings),
 
     .target(
       name: "IR",
