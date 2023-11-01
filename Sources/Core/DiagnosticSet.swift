@@ -43,6 +43,9 @@ public struct DiagnosticSet: Error {
 
 }
 
+extension DiagnosticSet: Sendable {
+}
+
 extension DiagnosticSet: ExpressibleByArrayLiteral {
 
   public init(arrayLiteral batch: Diagnostic...) {

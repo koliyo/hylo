@@ -1,7 +1,7 @@
 import Utils
 
 /// An object that provides context to interpret the generic parameters of a declaration.
-public struct GenericEnvironment {
+public struct GenericEnvironment : Sendable {
 
   /// An equivalence class and its associated conformances.
   private struct EquivalenceClass: Equatable {

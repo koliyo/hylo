@@ -1,5 +1,5 @@
 /// A half-open range of positions in a source file.
-public struct SourceRange: Hashable {
+public struct SourceRange: Hashable, Sendable {
 
   /// The source file containing the locations.
   public let file: SourceFile

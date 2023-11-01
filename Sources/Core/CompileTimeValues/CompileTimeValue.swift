@@ -1,5 +1,5 @@
 /// A value computed at compile-time.
-public protocol CompileTimeValue: Hashable {
+public protocol CompileTimeValue: Hashable, Sendable {
 
   /// The type of this value determined at compile-time.
   ///
@@ -7,7 +7,6 @@ public protocol CompileTimeValue: Hashable {
   /// generation. Its actual type of the might differ at run-time (e.g., if this value inhabits a
   /// union type).
   var staticType: AnyType { get }
-
 }
 
 extension CompileTimeValue {

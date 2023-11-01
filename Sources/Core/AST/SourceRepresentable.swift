@@ -33,6 +33,10 @@ extension SourceRepresentable: Hashable where Part: Hashable {
 
 }
 
+extension SourceRepresentable: Sendable where Part: Sendable {
+}
+
+
 extension SourceRepresentable: Codable where Part: Codable {
 
   fileprivate enum CodingKeys: String, CodingKey {

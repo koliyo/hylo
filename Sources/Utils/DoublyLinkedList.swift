@@ -6,7 +6,7 @@ public struct DoublyLinkedList<Element> {
   // after an element has been removed.
 
   /// The address of an element in a doubly linked list.
-  public struct Address: Hashable {
+  public struct Address: Hashable, Sendable {
 
     public fileprivate(set) var rawValue: Int
 

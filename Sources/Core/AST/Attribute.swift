@@ -1,8 +1,8 @@
 /// An attribute.
-public struct Attribute: Codable {
+public struct Attribute: Codable, Sendable {
 
   /// An attribute argument.
-  public enum Argument: Codable {
+  public enum Argument: Codable, Sendable {
 
     case string(SourceRepresentable<String>)
 

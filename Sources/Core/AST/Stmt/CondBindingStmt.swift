@@ -1,7 +1,7 @@
 /// A break statement.
 public struct CondBindingStmt: Stmt {
 
-  public enum Fallback: Codable {
+  public enum Fallback: Codable, Sendable {
 
     case expr(AnyExprID)
 

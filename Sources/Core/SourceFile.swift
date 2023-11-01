@@ -3,7 +3,7 @@ import Utils
 
 /// A Hylo source file, a synthesized fragment of Hylo source, or a fragment Hylo source embedded
 /// in a Swift string literal.
-public struct SourceFile {
+public struct SourceFile : Sendable {
 
   /// The notional stored properties of `self`; distinguished for encoding/decoding purposes.
   ///
@@ -324,7 +324,7 @@ extension SourceFile {
   ///
   /// `unowned Storage` can be used safely anywhere, because every `Storage` instance is owned by a
   /// threadsafe global dictionary, `Storage.allInstances,` and never deallocated.
-  public final class Storage: Codable, FactoryInitializable {
+  public final class Storage: Codable, FactoryInitializable, Sendable {
 
     /// The URL of the source file.
     fileprivate let url: URL
@@ -344,7 +344,7 @@ extension SourceFile {
     }
 
     /// The owner of all instances of `Storage`.
-    private static var allInstances = SharedMutable<[URL: Storage]>([:])
+    private static let allInstances = SharedMutable<[URL: Storage]>([:])
 
     /// Creates an alias to the instance with the given `url` if it exists, or creates a new
     /// instance having the given `url` and the text resulting from `makeText()`.

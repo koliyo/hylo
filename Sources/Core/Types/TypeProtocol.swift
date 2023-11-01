@@ -1,7 +1,7 @@
 import Utils
 
 /// A protocol describing the API of a Hylo type.
-public protocol TypeProtocol: Hashable {
+public protocol TypeProtocol: Hashable, Sendable {
 
   /// A set of flags describing recursive properties.
   var flags: TypeFlags { get }

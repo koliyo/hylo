@@ -25,7 +25,7 @@ import LLVM
 ///
 /// Supported operations include all LLVM arithmetic and comparison instructions on built-in
 /// integral and floating-point numbers as well as conversions from and to these types.
-public enum NativeInstruction: Hashable {
+public enum NativeInstruction: Hashable, Sendable {
 
   case add(LLVM.OverflowBehavior, BuiltinType)
 
@@ -119,7 +119,7 @@ public enum NativeInstruction: Hashable {
   case advancedByBytes(byteOffset: BuiltinType)
 
   /// The parameters of a floating-point LLVM instruction.
-  public struct MathFlags: OptionSet, Hashable {
+  public struct MathFlags: OptionSet, Hashable, Sendable {
 
     public typealias RawValue = UInt8
 

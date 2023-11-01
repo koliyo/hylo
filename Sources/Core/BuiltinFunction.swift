@@ -2,7 +2,7 @@ import LLVM
 import Utils
 
 /// A function representing an IR instruction in Hylo source code.
-public struct BuiltinFunction: Hashable {
+public struct BuiltinFunction: Hashable, Sendable {
 
   /// The name of the function.
   public let name: Name
@@ -24,7 +24,7 @@ public struct BuiltinFunction: Hashable {
 extension BuiltinFunction {
 
   /// The name of a built-in function.
-  public enum Name: Hashable {
+  public enum Name: Hashable, Sendable {
 
     /// An LLVM instruction.
     case llvm(NativeInstruction)

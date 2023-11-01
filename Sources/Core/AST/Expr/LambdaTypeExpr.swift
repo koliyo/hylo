@@ -2,7 +2,7 @@
 public struct LambdaTypeExpr: Expr {
 
   /// A parameter in a lambda type expression.
-  public struct Parameter: Codable {
+  public struct Parameter: Codable, Sendable {
 
     /// The label of the parameter.
     public var label: SourceRepresentable<Identifier>?

@@ -1,7 +1,7 @@
 import Utils
 
 /// An abstract syntax tree.
-public struct AST {
+public struct AST : Sendable {
 
   /// The stored representation of an AST; distinguished for encoding/decoding purposes.
   private struct Storage: Codable {

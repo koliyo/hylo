@@ -81,7 +81,7 @@ enum NameResolutionResult {
     }
 
     /// A candidate denoting a reference to the built-in module.
-    static var builtinModule = Candidate(
+    static let builtinModule = Candidate(
       reference: .builtinModule,
       type: .builtin(.module),
       constraints: [],

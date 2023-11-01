@@ -1,5 +1,5 @@
 /// A set of type flags.
-public struct TypeFlags: Hashable {
+public struct TypeFlags: Hashable, Sendable {
 
   /// Universal flags.
   private var universal: UInt8

@@ -1,8 +1,12 @@
 import OrderedCollections
 import Utils
 
+// TODO: How to handle this?
+extension OrderedDictionary : @unchecked Sendable {
+}
+
 /// A map from generic parameter to its argument.
-public struct GenericArguments {
+public struct GenericArguments : Sendable {
 
   /// A key in this map.
   public typealias Key = GenericParameterDecl.ID
