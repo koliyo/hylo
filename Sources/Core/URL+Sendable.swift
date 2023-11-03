@@ -1,7 +1,7 @@
 import Foundation
 
 #if !os(macOS)
-extension URL : Sendable {
+extension URL : @unchecked Sendable {
 
 }
 #endif
