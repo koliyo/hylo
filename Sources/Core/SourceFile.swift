@@ -33,8 +33,11 @@ public struct SourceFile {
     try self.init(contentsOf: URL(fileURLWithPath: filePath))
   }
 
-  public init(filePath: URL, withContent content: String) {
-    let storage = Storage(filePath, replace: true) { content[...] }
+  /// Creates an instance with the given `contents`, identified by `fileID`.
+  ///
+  /// `contents` may not reflect what—if anything—is stored on disk at `fileID`.
+  public init(contents: String, fileID: URL) {
+    let storage = Storage(fileID, replaceExisting: true) { contents[...] }
     self.storage = storage
   }
 
@@ -351,19 +354,19 @@ extension SourceFile {
     /// The owner of all instances of `Storage`.
     private static let allInstances = SharedMutable<[URL: Storage]>([:])
 
-    /// Creates an alias to the instance with the given `url` if it exists, or creates a new
+    /// Creates an alias to the instance with the given `url` if it exists, replacing the instance's text with the
+    /// result of `makeText()` iff `replaceExisting` is `true`, or creates a new
     /// instance having the given `url` and the text resulting from `makeText()`.
     fileprivate convenience init(
-      _ url: URL, lineStarts: [Index]? = nil, replace: Bool = false, makeText: () throws -> Substring
+      _ url: URL, lineStarts: [Index]? = nil, replaceExisting: Bool = false, makeText: () throws -> Substring
     ) rethrows {
       self.init(
         aliasing: try Self.allInstances.modify { (c: inout [URL: Storage]) -> Storage in
           try modify(&c[url]) { v in
             let r: Storage
-            if !replace && v != nil {
+            if !replaceExisting && v != nil {
               r = v!
-            }
-            else {
+            } else {
               r = try Storage(url: url, lineStarts: lineStarts, text: makeText())
             }
             v = r

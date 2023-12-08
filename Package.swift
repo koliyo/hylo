@@ -2,9 +2,9 @@
 import PackageDescription
 
 #if os(Windows)
-  let onWindows = true
+  let osIsWindows = true
 #else
-  let onWindows = false
+  let osIsWindows = false
 #endif
 
 /// Settings to be passed to swiftc for all targets.
@@ -137,7 +137,7 @@ let package = Package(
     .plugin(
       name: "TestGeneratorPlugin", capability: .buildTool(),
       // Workaround for SPM bug; see PortableBuildToolPlugin.swift
-      dependencies: onWindows ? [] : ["GenerateHyloFileTests"]),
+      dependencies: osIsWindows ? [] : ["GenerateHyloFileTests"]),
 
     .executableTarget(
       name: "GenerateHyloFileTests",
@@ -180,4 +180,15 @@ let package = Package(
       dependencies: ["Driver", "TestUtils"],
       swiftSettings: allTargetsSwiftSettings,
       plugins: ["TestGeneratorPlugin"]),
-  ])
+  ]
+  // On Windows we have a dummy library target that can be used to build all the build tool
+  // dependencies for non-reentrant builds.  See SPMBuildToolSupport/README.md for more info.
+    + (
+      osIsWindows ? [
+        .target(
+          name: "BuildToolDependencies",
+          dependencies: ["GenerateHyloFileTests"],
+          swiftSettings: allTargetsSwiftSettings)
+      ] : []
+    ) as [PackageDescription.Target]
+)
