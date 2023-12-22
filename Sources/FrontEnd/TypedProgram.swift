@@ -54,6 +54,7 @@ public struct TypedProgram {
   ///   - isTypeCheckingParallel: if `true`, the program is partitioned into chucks that are type
   ///     checked separately. Otherwise, type checking is performed sequentially. Either way, the
   ///     order in which declarations are being checked is undeterministic.
+  ///   - throwOnError: if `true`, any errors during typecheck will throw error
   ///   - shouldTraceInference: A closure accepting a node and its containing program, returning
   ///     `true` if a trace of type inference should be logged on the console for that node. The
   ///     closure is not called if `isTypeCheckingParallel` is `true`.
@@ -61,6 +62,7 @@ public struct TypedProgram {
     annotating base: ScopedProgram,
     inParallel isTypeCheckingParallel: Bool = false,
     reportingDiagnosticsTo log: inout DiagnosticSet,
+    throwOnError: Bool = true,
     tracingInferenceIf shouldTraceInference: ((AnyNodeID, TypedProgram) -> Bool)? = nil
   ) throws {
     let instanceUnderConstruction = SharedMutable(TypedProgram(partiallyFormedFrom: base))
@@ -95,9 +97,10 @@ public struct TypedProgram {
       checker.checkAllDeclarations()
 
       log.formUnion(checker.diagnostics)
-      try log.throwOnError()
+      if throwOnError {
+        try log.throwOnError()
+      }
       return checker.program
-
     }
   }
 
