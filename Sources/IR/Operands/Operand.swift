@@ -20,7 +20,7 @@ public enum Operand {
 
   /// Returns a built-in integer constant with the size of a machine word.
   public static func word(_ v: Int) -> Operand {
-    .constant(IntegerConstant(v, bitWidth: 64))
+    .constant(WordConstant(v))
   }
 
   /// The ID of the function in which the operand is defined, if any.
@@ -50,7 +50,7 @@ public enum Operand {
     }
   }
 
-  /// The payload if `self` is `.constant`. Otherwise, `nil`.
+  /// The payload if `self` is `.constant`, or `nil` otherwise.
   public var constant: (any Constant)? {
     switch self {
     case .constant(let c):

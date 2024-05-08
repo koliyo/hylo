@@ -139,7 +139,7 @@ struct ParserState {
     return token
   }
 
-  /// Fills the lookahead buffer until it contains `n` tokens, or fewer if the lexer is exhausted.
+  /// Returns up to the next `n` next tokens without consuming them.
   mutating func peek(_ n: Int) -> Deque<Token>.SubSequence {
     while lookahead.count < n {
       guard let t = lexer.next() else { break }
@@ -205,6 +205,15 @@ struct ParserState {
   mutating func takeWithoutSkippingWhitespace(_ kind: Token.Kind) -> Token? {
     if hasLeadingWhitespace { return nil }
     return take(kind)
+  }
+
+  /// Consumes and returns the next token iff it is a single question mark nor preceded by any
+  /// whitespace.
+  mutating func takePostfixQuestionMark() -> Token? {
+    if hasLeadingWhitespace { return nil }
+    return take(if: { [source = lexer.sourceCode] in
+      ($0.kind == .oper) && (source[$0.site] == "?")
+    })
   }
 
   /// Consumes and returns the next token if it satisfies `predicate`.
@@ -304,7 +313,7 @@ struct ParserState {
     ast.insert(n, diagnostics: &diagnostics)
   }
 
-  /// Inserts `n` into `self.ast`
+  /// Inserts `n` into `self.ast`.
   ///
   /// - Precondition: `n` is well-formed.
   mutating func insert<T: Node>(synthesized n: T) -> T.ID {

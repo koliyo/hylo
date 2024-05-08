@@ -6,6 +6,13 @@ extension Diagnostic {
     .error("ambiguous disjunction", at: site)
   }
 
+  static func error(autoclosureExpectsEmptyLambdaAt site: SourceRange, given: AnyType) -> Diagnostic
+  {
+    .error(
+      "autoclosure parameter expects lambda type with no parameters (given type: \(given))",
+      at: site)
+  }
+
   static func error(
     binding a: BindingPattern.Introducer, requiresInitializerAt site: SourceRange
   ) -> Diagnostic {
@@ -209,6 +216,12 @@ extension Diagnostic {
         (found \(found), expected \(expected))
         """, at: entity.site)
     }
+  }
+
+  static func error(
+    invalidBufferTypeArgumentCount found: Int, at site: SourceRange
+  ) -> Diagnostic {
+    .error("buffer type requires exactly one generic argument (found \(found))", at: site)
   }
 
   static func error(

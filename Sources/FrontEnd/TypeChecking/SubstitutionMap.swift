@@ -1,6 +1,6 @@
 import Core
 
-/// A substitution table mapping type variables to assumptions during type inference
+/// A substitution table mapping type variables to assumptions during type inference.
 struct SubstitutionMap {
 
   /// A policy for substituting type variales during reification.
@@ -40,7 +40,7 @@ struct SubstitutionMap {
   }
 
   /// Returns the substitution for `type` if it is a variable to which a type is assigned in this
-  /// map. Otherwise, returns `type`.
+  /// map; returns `type` otherwise.
   subscript(type: AnyType) -> AnyType {
     var walked = type
     while let a = TypeVariable(walked) {
@@ -130,10 +130,10 @@ struct SubstitutionMap {
   /// Returns `v` with its type variables replaced by their their corresponding value in `self`,
   /// applying `substitutionPolicy` to handle free variables.
   private func reify(
-    value v: any CompileTimeValue, withVariables substitutionPolicy: SubstitutionPolicy
-  ) -> any CompileTimeValue {
-    if let t = v as? AnyType {
-      return reify(t, withVariables: substitutionPolicy)
+    value v: CompileTimeValue, withVariables substitutionPolicy: SubstitutionPolicy
+  ) -> CompileTimeValue {
+    if case .type(let t) = v {
+      return .type(reify(t, withVariables: substitutionPolicy))
     } else {
       return v
     }

@@ -20,6 +20,7 @@ private protocol TypeBox {
   func transformParts<M>(
     mutating m: inout M, _ transformer: (inout M, AnyType) -> TypeTransformAction
   ) -> any TypeProtocol
+
 }
 
 /// A box wrapping an instance of `Base`.
@@ -50,6 +51,7 @@ private struct ConcreteTypeBox<Base: TypeProtocol>: TypeBox {
   ) -> any TypeProtocol {
     base.transformParts(mutating: &m, transformer)
   }
+
 }
 
 /// The (static) type of an entity.
@@ -175,7 +177,7 @@ public struct AnyType {
   /// Indicates whether `self` has a record layout.
   public var hasRecordLayout: Bool {
     switch base {
-    case is LambdaType, is ProductType, is TupleType:
+    case is BufferType, is LambdaType, is ProductType, is TupleType:
       return true
     case let type as BoundGenericType:
       return type.base.hasRecordLayout
@@ -187,8 +189,22 @@ public struct AnyType {
   /// Returns `self` with occurrences of free type variables replaced by errors.
   public var replacingVariablesWithErrors: AnyType {
     self.transform { (t) in
-      if t.isTypeVariable {
+      if t.base is TypeVariable {
         return .stepOver(.error)
+      } else if t[.hasVariable] {
+        return .stepInto(t)
+      } else {
+        return .stepOver(t)
+      }
+    }
+  }
+
+  /// Inserts the type variables that occur free in `self` into `s`.
+  public func collectOpenVariables(in s: inout Set<TypeVariable>) {
+    _ = self.transform(mutating: &s) { (partialResult, t) in
+      if let v = TypeVariable(t) {
+        partialResult.insert(v)
+        return .stepOver(t)
       } else if t[.hasVariable] {
         return .stepInto(t)
       } else {
@@ -214,10 +230,10 @@ public struct AnyType {
       var result = lhs.base.matches(rhs.base, mutating: &unifier, unify)
       for (a, b) in zip(lhs.arguments, rhs.arguments) {
         switch (a.value, b.value) {
-        case (let vl as AnyType, let vr as AnyType):
+        case (.type(let vl), .type(let vr)):
           result = vl.matches(vr, mutating: &unifier, unify) && result
         default:
-          result = a.value.equals(b.value) && result
+          result = a.value == b.value && result
         }
       }
       return result
@@ -282,12 +298,6 @@ extension AnyType: TypeProtocol {
   ) -> AnyType {
     AnyType(wrapped.transformParts(mutating: &m, transformer))
   }
-
-}
-
-extension AnyType: CompileTimeValue {
-
-  public var staticType: AnyType { ^MetatypeType(of: self) }
 
 }
 

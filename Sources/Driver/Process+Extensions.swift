@@ -27,12 +27,16 @@ extension Process {
     /// The contents of the standard error stream.
     public let standardError: Lazy<String>
 
-    /// The command-line that triggered the process run.
-    public let commandLine: [String]
+    /// The executable run by the process.
+    public let executable: URL
+
+    /// The arguments passed to executable ran by the process.
+    public let arguments: [String]
+
   }
 
-  /// Runs `executable` with the given command line `arguments` and returns its exit status along
-  /// with the text written to its standard output and standard error streams.
+  /// Runs `executable` with the given command line `arguments` and returns the text written to its
+  /// standard output and standard error streams, throwing `NonzeroExit` if the command fails.
   public static func run(_ executable: URL, arguments: [String] = []) throws -> OutputText {
     let p = Process()
     let pipes = (standardOutput: Pipe(), standardError: Pipe())
@@ -51,8 +55,10 @@ extension Process {
     if p.terminationStatus != 0 {
       throw NonzeroExit(
         terminationStatus: p.terminationStatus,
-        standardOutput: r.standardOutput, standardError: r.standardError,
-        commandLine: [executable.fileSystemPath] + arguments)
+        standardOutput: r.standardOutput,
+        standardError: r.standardError,
+        executable: executable,
+        arguments: arguments)
     }
 
     return r
@@ -60,16 +66,34 @@ extension Process {
 
 }
 
-extension Process.NonzeroExit: CustomStringConvertible {
+extension Process.NonzeroExit: CustomStringConvertible, CustomDebugStringConvertible {
 
   public var description: String {
-    return """
-      NonzeroExit(
-        terminationStatus: \(terminationStatus),
-        standardOutput: \(String(reflecting: standardOutput[])),
-        standardError: \(String(reflecting: standardError[])),
-        commandLine: \(commandLine))
-      """
+    """
+    Process.NonzeroExit (status: \(terminationStatus))
+    Command line: \(([executable.fileSystemPath] + arguments).map(String.init(reflecting:)).joined(separator: " "))
+
+      standard output:
+      -------------
+    \(standardOutput[])
+      -------------
+
+      standard error:
+      -------------
+    \(standardError[])
+      -------------
+    """
+  }
+
+  public var debugDescription: String {
+    """
+    Process.NonzeroExit(
+      terminationStatus: \(terminationStatus),
+      standardOutput: \(String(reflecting: standardOutput[])),
+      standardError: \(String(reflecting: standardError[])),
+      executable: \(String(reflecting: executable)),
+      arguments: \(String(reflecting: arguments)))
+    """
   }
 
 }

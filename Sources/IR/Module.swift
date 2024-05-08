@@ -82,7 +82,7 @@ public struct Module {
     _modify { yield &functions[i.function]![i.block].instructions[i.address] }
   }
 
-  /// Accesses the instruction denoted by `o` if it is `.register`. Otherwise, returns `nil`.
+  /// Accesses the instruction denoted by `o` if it is `.register`; returns `nil` otherwise.
   public subscript(o: Operand) -> Instruction? {
     if case .register(let i) = o {
       return self[i]
@@ -319,7 +319,6 @@ public struct Module {
     let parameters = program.accumulatedGenericParameters(in: d)
     let output = program.canonical(
       (program[d].type.base as! CallableType).output, in: program[d].scope)
-
     let inputs = loweredParameters(of: d)
 
     let entity = Function(
@@ -473,7 +472,7 @@ public struct Module {
   ) -> FunctionReference {
     var a = witness.arguments
     if let m = program.traitMember(referredBy: d) {
-      a = a.merging([program[m.trait.decl].receiver: witness.model])
+      a = a.merging([program[m.trait.decl].receiver: .type(witness.model)])
     }
     return FunctionReference(to: d, in: self, specializedBy: a, in: witness.scope)
   }
@@ -605,7 +604,7 @@ public struct Module {
         UNIMPLEMENTED()
       }
 
-      result[p] = ^u
+      result[p] = .type(^u)
     }
     return result
   }

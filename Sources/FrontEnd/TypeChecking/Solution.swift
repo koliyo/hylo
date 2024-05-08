@@ -29,6 +29,9 @@ struct Solution {
   /// The name binding assumptions made by the solver.
   private(set) var bindingAssumptions: BindingMap
 
+  /// A map from call expression to its operands after desugaring and implicit resolution.
+  private(set) var callOperands: [CallID: [ArgumentResolutionResult]]
+
   /// The penalties of the solution.
   private(set) var penalties: Int
 
@@ -40,19 +43,23 @@ struct Solution {
 
   /// Creates an empty solution.
   init() {
-    self.init(substitutions: [:], bindings: [:], penalties: 0, diagnostics: [], stale: [])
+    self.init(
+      substitutions: [:], bindings: [:], callOperands: [:],
+      penalties: 0, diagnostics: [], stale: [])
   }
 
   /// Creates an instance with the given properties.
   init(
     substitutions typeAssumptions: SubstitutionMap,
     bindings bindingAssumptions: [NameExpr.ID: DeclReference],
+    callOperands: [CallID: [ArgumentResolutionResult]],
     penalties: Int,
     diagnostics: DiagnosticSet,
     stale: [Constraint]
   ) {
     self.typeAssumptions = typeAssumptions
     self.bindingAssumptions = bindingAssumptions
+    self.callOperands = callOperands
     self.penalties = penalties
     self.diagnostics = diagnostics
     self.stale = stale
@@ -75,7 +82,7 @@ struct Solution {
 
   /// Removes the type and binding assumptions that aren't in `other` and incorporate the
   /// penalties and diagnostics of `other` into `self`.
-  mutating func merge(_ other: Self) {
+  mutating func formIntersection(_ other: Self) {
     typeAssumptions.formIntersection(other.typeAssumptions)
     bindingAssumptions.formIntersection(other.bindingAssumptions)
     penalties = max(penalties, other.penalties)

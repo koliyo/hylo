@@ -21,6 +21,9 @@ public struct SynthesizedFunctionDecl: Hashable {
     /// A global initializer for a binding declaration.
     case globalInitialization(BindingDecl.ID)
 
+    /// Lambda generated for an autoclosure argument.
+    case autoclosure(AnyExprID)
+
   }
 
   /// The type of this declaration.
@@ -48,9 +51,10 @@ public struct SynthesizedFunctionDecl: Hashable {
 
   /// Returns the generic parameters of the declaration.
   public var genericParameters: [GenericParameterDecl.ID] {
+    guard !type.captures.isEmpty else { return [] }
     guard let t = BoundGenericType(receiver) else { return [] }
     return t.arguments.compactMap { (k, v) -> GenericParameterDecl.ID? in
-      if let u = v as? AnyType {
+      if case .type(let u) = v {
         return GenericTypeParameterType(u)?.decl == k ? k : nil
       } else {
         UNIMPLEMENTED("compile time values")
@@ -63,7 +67,7 @@ public struct SynthesizedFunctionDecl: Hashable {
 extension SynthesizedFunctionDecl: CustomStringConvertible {
 
   public var description: String {
-    "(\(receiver)).\(kind)"
+    type.captures.isEmpty ? "\(scope).\(kind)" : "\(scope).(\(receiver)).\(kind)"
   }
 
 }

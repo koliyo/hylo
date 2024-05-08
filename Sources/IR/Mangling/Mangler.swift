@@ -106,10 +106,10 @@ struct Mangler {
     mangle(decl: v, to: &output)
   }
 
-  /// Writes the mangled qualification of `d` to `output`.
-  private mutating func writeQualification<T: DeclID>(of d: T, to output: inout Output) {
+  /// Writes the mangled qualification of `n` to `output`.
+  private mutating func writeQualification<T: NodeIDProtocol>(of n: T, to output: inout Output) {
     var qualification: [AnyScopeID] = []
-    for s in program.scopes(from: program[d].scope) {
+    for s in program.scopes(from: program[n].scope) {
       if writeLookup(.node(AnyNodeID(s)), to: &output) {
         break
       } else {
@@ -354,6 +354,10 @@ struct Mangler {
   ) {
     write(operator: .synthesizedFunctionDecl, to: &output)
     write(synthesizedKind: symbol.kind, to: &output)
+
+    if symbol.scope.kind != ModuleDecl.self {
+      writeQualification(of: symbol.scope, to: &output)
+    }
     write(scope: symbol.scope, to: &output)
     mangle(type: ^symbol.type, to: &output)
   }
@@ -374,6 +378,10 @@ struct Mangler {
     case .globalInitialization(let d):
       write(base64Didit: 4, to: &output)
       write(entity: d, to: &output)
+    case .autoclosure(let e):
+      write(base64Didit: 5, to: &output)
+      // To allow using multiple autoclosures in the same scope, also write the expression ID.
+      write(integer: e.rawValue, to: &output)
     }
   }
 
@@ -401,10 +409,13 @@ struct Mangler {
   }
 
   /// Writes the mangled representation of `symbol` to `output`.
-  mutating func mangle(value symbol: any CompileTimeValue, to output: inout Output) {
-    if let t = symbol as? AnyType {
+  mutating func mangle(value symbol: CompileTimeValue, to output: inout Output) {
+    switch symbol {
+    case .type(let t):
       mangle(type: t, to: &output)
-    } else {
+    case .compilerKnown(let v) where v is Int:
+      write(integer: v as! Int, to: &output)
+    default:
       UNIMPLEMENTED()
     }
   }
@@ -423,6 +434,9 @@ struct Mangler {
 
     case let t as BoundGenericType:
       write(boundGenericType: t, to: &output)
+
+    case let t as BufferType:
+      write(bufferType: t, to: &output)
 
     case let t as BuiltinType:
       write(builtinType: t, to: &output)
@@ -500,6 +514,13 @@ struct Mangler {
     for u in t.arguments.values {
       mangle(value: u, to: &output)
     }
+  }
+
+  /// Writes the mangled representation of `t` to `output`.
+  private mutating func write(bufferType t: BufferType, to output: inout Output) {
+    write(operator: .bufferType, to: &output)
+    mangle(type: t.element, to: &output)
+    mangle(value: t.count, to: &output)
   }
 
   /// Writes the mangled representation of `symbol` to `output`.
@@ -615,7 +636,7 @@ struct Mangler {
   }
 
   /// If `symbol` is reserved or has already been inserted in the symbol lookup table, writes a
-  /// lookup reference to it and returns `true`. Otherwise, returns `false`.
+  /// lookup reference to it and returns `true`; returns `false` otherwise.
   private func writeLookup(_ symbol: Symbol, to output: inout Output) -> Bool {
     if let r = reserved[symbol] {
       write(operator: .reserved, to: &output)

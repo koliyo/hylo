@@ -477,6 +477,17 @@ final class ParserTests: XCTestCase {
     XCTAssertNotNil(decl.body)
   }
 
+  func testFunctionDeclWithAutoclosure() throws {
+    let input: SourceFile = "fun foo<E>(value: @autoclosure ([E]() -> Int)) { &value() }"
+    let (declID, ast) = try input.parseWithDeclPrologue(with: Parser.parseFunctionOrMethodDecl)
+    let decl = try XCTUnwrap(ast[declID] as? FunctionDecl)
+    XCTAssertNotNil(decl)
+    XCTAssertEqual(decl.parameters.count, 1)
+    let p = ast[decl.parameters[0]]
+    let e = try XCTUnwrap(ast[p.annotation])
+    XCTAssert(e.isAutoclosure)
+  }
+
   func testMethodBundle() throws {
     let input: SourceFile = """
       fun foo() {
@@ -734,44 +745,59 @@ final class ParserTests: XCTestCase {
 
   func testParameterDecl() throws {
     let input: SourceFile = "_ foo"
-    let (declID, ast) = try apply(Parser.parameterDecl, on: input)
-    let decl = try XCTUnwrap(ast[declID])
-    XCTAssertEqual(decl.baseName, "foo")
+    let (d, ast) = try input.parse(with: Parser.parseParameterDecl(in:))
+    XCTAssertEqual(ast[d]?.baseName, "foo")
   }
 
   func testParameterDeclWithAnnotation() throws {
     let input: SourceFile = "_ foo: T"
-    let (declID, ast) = try apply(Parser.parameterDecl, on: input)
-    let decl = try XCTUnwrap(ast[declID])
-    XCTAssertNotNil(decl.annotation)
+    let (d, ast) = try input.parse(with: Parser.parseParameterDecl(in:))
+    XCTAssertNotNil(ast[d]?.annotation)
   }
 
   func testParameterDeclWithDefault() throws {
     let input: SourceFile = "_ foo: T = T()"
-    let (declID, ast) = try apply(Parser.parameterDecl, on: input)
-    let decl = try XCTUnwrap(ast[declID])
-    XCTAssertNotNil(decl.defaultValue)
+    let (d, ast) = try input.parse(with: Parser.parseParameterDecl(in:))
+    XCTAssertNotNil(ast[d]?.defaultValue)
+  }
+
+  func testParameterDeclImplicit() throws {
+    let input: SourceFile = "_ foo?: T"
+    let (d, ast) = try input.parse(with: Parser.parseParameterDecl(in:))
+    let tree = try XCTUnwrap(ast[d])
+    XCTAssert(tree.isImplicit)
   }
 
   func testParameterInterfaceLabelAndName() throws {
     let input: SourceFile = "for name"
-    let interface = try XCTUnwrap(try apply(Parser.parameterInterface, on: input).element)
-    XCTAssertEqual(interface.label?.value, "for")
-    XCTAssertEqual(interface.name.value, "name")
+    let tree = try XCTUnwrap(input.parse(with: Parser.parseParameterInterface(in:)).element)
+    XCTAssertEqual(tree.label?.value, "for")
+    XCTAssertEqual(tree.name.value, "name")
+    XCTAssertNil(tree.implicitMarker)
   }
 
   func testParameterInterfaceUnderscoreAndName() throws {
     let input: SourceFile = "_ name"
-    let interface = try XCTUnwrap(try apply(Parser.parameterInterface, on: input).element)
-    XCTAssertNil(interface.label)
-    XCTAssertEqual(interface.name.value, "name")
+    let tree = try XCTUnwrap(input.parse(with: Parser.parseParameterInterface(in:)).element)
+    XCTAssertNil(tree.label)
+    XCTAssertEqual(tree.name.value, "name")
+    XCTAssertNil(tree.implicitMarker)
   }
 
   func testParameterInterfaceOnlyName() throws {
     let input: SourceFile = "name"
-    let interface = try XCTUnwrap(try apply(Parser.parameterInterface, on: input).element)
-    XCTAssertEqual(interface.label?.value, "name")
-    XCTAssertEqual(interface.name.value, "name")
+    let tree = try XCTUnwrap(input.parse(with: Parser.parseParameterInterface(in:)).element)
+    XCTAssertEqual(tree.label?.value, "name")
+    XCTAssertEqual(tree.name.value, "name")
+    XCTAssertNil(tree.implicitMarker)
+  }
+
+  func testParameterInterfaceImplicit() throws {
+    let input: SourceFile = "in context?"
+    let tree = try XCTUnwrap(input.parse(with: Parser.parseParameterInterface(in:)).element)
+    XCTAssertEqual(tree.label?.value, "in")
+    XCTAssertEqual(tree.name.value, "context")
+    XCTAssertNotNil(tree.implicitMarker)
   }
 
   func testOperatorDecl() throws {
@@ -935,6 +961,14 @@ final class ParserTests: XCTestCase {
     } else {
       XCTFail()
     }
+  }
+
+  func testMethodCallOnIntegerLiteral() throws {
+    // See #1037
+    let input: SourceFile = "1.copy()"
+    let (e, ast) = try input.parse(with: Parser.parseExpr(in:))
+    let call = try XCTUnwrap(ast[e] as? FunctionCallExpr)
+    XCTAssertEqual(input[ast[call.callee].site], "1.copy")
   }
 
   // MARK: Compound expressions
@@ -1366,16 +1400,16 @@ final class ParserTests: XCTestCase {
 
   func testParameterTypeExpr() throws {
     let input: SourceFile = "sink T"
-    let (exprID, ast) = try apply(Parser.parameterTypeExpr, on: input)
-    let expr = try XCTUnwrap(ast[exprID])
-    XCTAssertEqual(expr.convention.value, .sink)
+    let (e, ast) = try input.parse(with: Parser.parseParameterTypeExpr(in:))
+    let tree = try XCTUnwrap(ast[e])
+    XCTAssertEqual(tree.convention.value, .sink)
   }
 
   func testImplicitLetParameterTypeExpr() throws {
     let input: SourceFile = "T"
-    let (exprID, ast) = try apply(Parser.parameterTypeExpr, on: input)
-    let expr = try XCTUnwrap(ast[exprID])
-    XCTAssertEqual(expr.convention.value, .let)
+    let (e, ast) = try input.parse(with: Parser.parseParameterTypeExpr(in:))
+    let tree = try XCTUnwrap(ast[e])
+    XCTAssertEqual(tree.convention.value, .let)
   }
 
   func testStaticArgumentList() throws {
@@ -1911,16 +1945,16 @@ final class ParserTests: XCTestCase {
 
   // MARK: Attributes
 
-  func testDeclAttribute() throws {
+  func testAttribute() throws {
     let input: SourceFile = "@attr"
-    let attribute = try XCTUnwrap(input.parse(with: Parser.parseDeclAttribute).element)
+    let attribute = try XCTUnwrap(input.parse(with: Parser.parseAttribute).element)
     XCTAssertEqual(attribute.value.name.value, "@attr")
     XCTAssertEqual(attribute.value.arguments.count, 0)
   }
 
-  func testDeclAttributeWithArguments() throws {
+  func testAttributeWithArguments() throws {
     let input: SourceFile = #"@attr(8, "Hylo")"#
-    let attribute = try XCTUnwrap(input.parse(with: Parser.parseDeclAttribute).element)
+    let attribute = try XCTUnwrap(input.parse(with: Parser.parseAttribute).element)
     XCTAssertEqual(attribute.value.name.value, "@attr")
     XCTAssertEqual(attribute.value.arguments.count, 2)
   }

@@ -215,6 +215,8 @@ extension LLVM.Module {
     from ir: IR.Program
   ) -> LLVM.IRValue {
     switch c {
+    case let v as IR.WordConstant:
+      return transpiledConstant(v, usedIn: m, from: ir)
     case let v as IR.IntegerConstant:
       return transpiledConstant(v, usedIn: m, from: ir)
     case let v as IR.FloatingPointConstant:
@@ -230,6 +232,13 @@ extension LLVM.Module {
     default:
       unreachable()
     }
+  }
+
+  /// Returns the LLVM IR value corresponding to the Hylo IR constant `c` when used in `m` in `ir`.
+  private mutating func transpiledConstant(
+    _ c: IR.WordConstant, usedIn m: IR.Module, from ir: IR.Program
+  ) -> LLVM.IRValue {
+    word().constant(c.value)
   }
 
   /// Returns the LLVM IR value corresponding to the Hylo IR constant `c` when used in `m` in `ir`.
@@ -520,8 +529,6 @@ extension LLVM.Module {
   ) {
     addAttribute(named: .noalias, to: llvmParameter)
     addAttribute(named: .nofree, to: llvmParameter)
-    addAttribute(named: .nonnull, to: llvmParameter)
-    addAttribute(named: .noundef, to: llvmParameter)
 
     if !m[f].isSubscript {
       addAttribute(named: .nocapture, to: llvmParameter)
@@ -559,7 +566,7 @@ extension LLVM.Module {
     /// one-to-one mapping from Hylo registers to LLVM registers.
     var byproduct: [IR.InstructionID: (slide: LLVM.IRValue, frame: LLVM.IRValue)] = [:]
 
-    /// The address of the function's frame if `f` is a subscript. Otherwise, `nil`.
+    /// The address of the function's frame if `f` is a subscript, or `nil` otherwise.
     let frame: LLVM.IRValue?
 
     /// The prologue of the transpiled function, which contains its stack allocations.
@@ -601,6 +608,8 @@ extension LLVM.Module {
         insert(addressToPointer: i)
       case is IR.AdvancedByBytes:
         insert(advancedByBytes: i)
+      case is IR.AdvancedByStrides:
+        insert(advancedByStrides: i)
       case is IR.AllocStack:
         insert(allocStack: i)
       case is IR.Access:
@@ -683,10 +692,26 @@ extension LLVM.Module {
     }
 
     /// Inserts the transpilation of `i` at `insertionPoint`.
+    func insert(advancedByStrides i: IR.InstructionID) {
+      let s = m[i] as! AdvancedByStrides
+
+      let base = llvm(s.base)
+      let baseType = ir.llvm(m.type(of: s.base).ast, in: &self)
+      let indices = [i32.constant(0), i32.constant(s.offset)]
+      let v = insertGetElementPointerInBounds(
+        of: base, typed: baseType, indices: indices, at: insertionPoint)
+      register[.register(i)] = v
+    }
+
+    /// Inserts the transpilation of `i` at `insertionPoint`.
     func insert(allocStack i: IR.InstructionID) {
       let s = m[i] as! AllocStack
       let t = ir.llvm(s.allocatedType, in: &self)
-      register[.register(i)] = insertAlloca(t, atEntryOf: transpilation)
+      if layout.storageSize(of: t) == 0 {
+        register[.register(i)] = ptr.null
+      } else {
+        register[.register(i)] = insertAlloca(t, atEntryOf: transpilation)
+      }
     }
 
     /// Inserts the transpilation of `i` at `insertionPoint`.
@@ -1103,14 +1128,14 @@ extension LLVM.Module {
     func insert(switch i: IR.InstructionID) {
       let s = m[i] as! Switch
 
-      // Pick the case 0 as the "default".
-      let cases = s.successors[1...].enumerated().map { (value, destination) in
+      let branches = s.successors.enumerated().map { (value, destination) in
         (word().constant(UInt64(value)), block[destination]!)
       }
 
+      // The last branch is the "default".
       let n = llvm(s.index)
       insertSwitch(
-        on: n, cases: cases, default: block[s.successors[0]]!,
+        on: n, cases: branches.dropLast(), default: branches.last!.1,
         at: insertionPoint)
     }
 

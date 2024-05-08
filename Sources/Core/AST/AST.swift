@@ -279,22 +279,34 @@ public struct AST {
   }
 
   /// Returns a table mapping each parameter of `d` to its default argument if `d` is a function,
-  /// initializer, method or subscript declaration. Otherwise, returns `nil`.
+  /// initializer, method or subscript declaration; otherwise, returns `nil`.
   public func defaultArguments(of d: AnyDeclID) -> [AnyExprID?]? {
-    let parameters: [ParameterDecl.ID]
+    runtimeParameters(of: d)?.map({ self[$0].defaultValue })
+  }
+
+  /// Returns the run-time parameters of `d` iff `d` is callable.
+  public func runtimeParameters(of d: AnyDeclID) -> [ParameterDecl.ID]? {
     switch d.kind {
     case FunctionDecl.self:
-      parameters = self[FunctionDecl.ID(d)!].parameters
+      return self[FunctionDecl.ID(d)!].parameters
     case InitializerDecl.self:
-      parameters = self[InitializerDecl.ID(d)!].parameters
+      return self[InitializerDecl.ID(d)!].parameters
     case MethodDecl.self:
-      parameters = self[MethodDecl.ID(d)!].parameters
+      return self[MethodDecl.ID(d)!].parameters
     case SubscriptDecl.self:
-      parameters = self[SubscriptDecl.ID(d)!].parameters
+      return self[SubscriptDecl.ID(d)!].parameters
     default:
       return nil
     }
-    return self[parameters].map(\.defaultValue)
+  }
+
+  /// Returns the generic parameters introduced by `d`.
+  public func genericParameters(introducedBy d: AnyDeclID) -> [GenericParameterDecl.ID] {
+    if let s = self[d] as? GenericScope {
+      return s.genericParameters
+    } else {
+      return []
+    }
   }
 
   /// Returns the name of `d` unless `d` is anonymous.
@@ -429,7 +441,7 @@ public struct AST {
     self[self[self[s].binding].pattern].introducer.value.isConsuming
   }
 
-  /// Returns the source site of `expr`
+  /// Returns the source site of `expr`.
   public func site(of expr: FoldedSequenceExpr) -> SourceRange {
     switch expr {
     case .leaf(let i):

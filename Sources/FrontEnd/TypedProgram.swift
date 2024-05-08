@@ -38,6 +38,9 @@ public struct TypedProgram {
   /// A map from name expression to its referred declaration.
   public internal(set) var referredDecl: BindingMap = [:]
 
+  /// A map from call expression to its operands after desugaring and implicit resolution.
+  public internal(set) var callOperands: [CallID: [ArgumentResolutionResult]] = [:]
+
   /// A map from sequence expressions to their evaluation order.
   public internal(set) var foldedForm: [SequenceExpr.ID: FoldedSequenceExpr] = [:]
 
@@ -61,6 +64,9 @@ public struct TypedProgram {
     tracingInferenceIf shouldTraceInference: ((AnyNodeID, TypedProgram) -> Bool)? = nil
   ) throws {
     let instanceUnderConstruction = SharedMutable(TypedProgram(partiallyFormedFrom: base))
+    #if os(macOS) && DEBUG
+      let isTypeCheckingParallel = isTypeCheckingParallel && false
+    #endif
 
     if isTypeCheckingParallel {
       let sources = base.ast[base.ast.modules].map(\.sources).joined()
@@ -81,14 +87,18 @@ public struct TypedProgram {
       }
     }
 
-    var checker = TypeChecker(
-      constructing: instanceUnderConstruction[],
-      tracingInferenceIf: isTypeCheckingParallel ? nil : shouldTraceInference)
-    checker.checkAllDeclarations()
+    self = try instanceUnderConstruction.read {
 
-    log.formUnion(checker.diagnostics)
-    try log.throwOnError()
-    self = checker.program
+      var checker = TypeChecker(
+        constructing: $0,
+        tracingInferenceIf: isTypeCheckingParallel ? nil : shouldTraceInference)
+      checker.checkAllDeclarations()
+
+      log.formUnion(checker.diagnostics)
+      try log.throwOnError()
+      return checker.program
+
+    }
   }
 
   /// The type checking of a collection of source files.
@@ -140,9 +150,7 @@ public struct TypedProgram {
   }
 
   /// Returns the canonical form of `v` in `scopeOfUse`.
-  public func canonical(
-    _ v: any CompileTimeValue, in scopeOfUse: AnyScopeID
-  ) -> any CompileTimeValue {
+  public func canonical(_ v: CompileTimeValue, in scopeOfUse: AnyScopeID) -> CompileTimeValue {
     var checker = TypeChecker(asContextFor: self)
     return checker.canonical(v, in: scopeOfUse)
   }
@@ -179,8 +187,8 @@ public struct TypedProgram {
   ) -> GenericArguments {
     var checker = TypeChecker(asContextFor: self)
     return arguments.mapValues { (v) in
-      if let t = v as? AnyType {
-        return checker.specialize(t, for: specialization, in: scopeOfUse)
+      if case .type(let t) = v {
+        return .type(checker.specialize(t, for: specialization, in: scopeOfUse))
       } else {
         UNIMPLEMENTED()
       }
@@ -213,6 +221,8 @@ public struct TypedProgram {
     if !c.implementations.uniqueElement!.value.isSynthetic { return false }
 
     switch model.base {
+    case let u as BufferType:
+      return isTriviallyDeinitializable(u.element, in: scopeOfUse)
     case let u as TupleType:
       return u.elements.allSatisfy({ isTriviallyDeinitializable($0.type, in: scopeOfUse) })
     case let u as UnionType:
@@ -230,6 +240,8 @@ public struct TypedProgram {
   public func storage(of t: AnyType) -> [TupleType.Element] {
     switch t.base {
     case let u as BoundGenericType:
+      return storage(of: u)
+    case let u as BufferType:
       return storage(of: u)
     case let u as LambdaType:
       return storage(of: u)
@@ -254,6 +266,15 @@ public struct TypedProgram {
   }
 
   /// Returns the names and types of `t`'s stored properties.
+  public func storage(of t: BufferType) -> [TupleType.Element] {
+    if let w = t.count.asCompilerKnown(Int.self) {
+      return Array(repeating: .init(label: nil, type: t.element), count: w)
+    } else {
+      return []
+    }
+  }
+
+  /// Returns the names and types of `t`'s stored properties.
   public func storage(of t: LambdaType) -> [TupleType.Element] {
     let callee = TupleType.Element(label: "__f", type: .builtin(.ptr))
     return [callee] + t.captures
@@ -272,8 +293,8 @@ public struct TypedProgram {
     return result
   }
 
-  /// Returns the generic parameters captured in the scope of `d` if `d` is callable. Otherwise,
-  /// returns an empty collection.
+  /// Returns the generic parameters captured in the scope of `d` if `d` is callable; returns an
+  /// empty collection otherwise.
   public func liftedGenericParameters(of d: AnyDeclID) -> [GenericParameterDecl.ID] {
     switch d.kind {
     case FunctionDecl.self:
@@ -304,7 +325,7 @@ public struct TypedProgram {
   }
 
   /// If `d` is member of a trait `c`, returns `(d, c)` if `d` is a requirement, or `(r, c)` if `d`
-  /// is a default implementation of a requirement `r`. Otherwise, returns `nil`.
+  /// is a default implementation of a requirement `r`; returns `nil` otherwise.
   public func requirementDeclaring(_ d: AnyDeclID) -> (decl: AnyDeclID, trait: TraitType)? {
     guard let c = traitDeclaring(d) else { return nil }
 
@@ -371,7 +392,7 @@ public struct TypedProgram {
   ) -> Conformance? {
     var checker = TypeChecker(asContextFor: self)
     let bounds = checker.conformedTraits(
-      declaredInEnvironmentIntroducing: model,
+      declaredByConstraintsOn: model,
       exposedTo: scopeOfUse)
     guard bounds.contains(concept) else { return nil }
 
@@ -393,6 +414,9 @@ public struct TypedProgram {
     assert(model[.isCanonical])
 
     switch model.base {
+    case let m as BufferType:
+      // FIXME: To remove once conditional conformance is implemented
+      guard conforms(m.element, to: concept, in: scopeOfUse) else { return nil }
     case let m as LambdaType:
       guard allConform(m.captures.map(\.type), to: concept, in: scopeOfUse) else { return nil }
     case let m as TupleType:
@@ -411,7 +435,7 @@ public struct TypedProgram {
     for requirement in ast.requirements(of: concept.decl) {
       guard let k = ast.synthesizedKind(of: requirement, definedBy: concept) else { return nil }
 
-      let a: GenericArguments = [ast[concept.decl].receiver: model]
+      let a: GenericArguments = [ast[concept.decl].receiver: .type(model)]
       let t = LambdaType(specialize(declType[requirement]!, for: a, in: scopeOfUse))!
       let d = SynthesizedFunctionDecl(k, typed: t, in: scopeOfUse)
       implementations[requirement] = .synthetic(d)
@@ -453,13 +477,7 @@ public struct TypedProgram {
     return result
   }
 
-  /// Returns the scope of the declaration extended by `d`, if any.
-  public func scopeExtended<T: TypeExtendingDecl>(by d: T.ID) -> AnyScopeID? {
-    var checker = TypeChecker(asContextFor: self)
-    return checker.scopeExtended(by: d)
-  }
-
-  /// Returns the modules visible to `s`:
+  /// Returns the modules visible to `s`.
   public func modules(exposedTo s: AnyScopeID) -> Set<ModuleDecl.ID> {
     if let m = ModuleDecl.ID(s) {
       return [m]

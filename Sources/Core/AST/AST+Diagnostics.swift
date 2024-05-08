@@ -65,6 +65,10 @@ extension Diagnostic {
       at: d.introducer.site)
   }
 
+  static func error(unexpectedAttribute a: Attribute, at site: SourceRange) -> Diagnostic {
+    .error("unexpected attribute '\(a.name.value)'", at: site)
+  }
+
   public static func error(
     unexpectedMemberModifier m: SourceRepresentable<MemberModifier>
   ) -> Diagnostic {
