@@ -12,11 +12,11 @@ import Utils
 private let libraryRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 
 /// The root of a directory hierarchy containing all the standard library sources.
-private let hostedLibrarySourceRoot = libraryRoot.appendingPathComponent("Sources")
+public let hostedLibrarySourceRoot = libraryRoot.appendingPathComponent("Sources")
 
 /// The root of a directory hierarchy containing the sources for the standard library's freestanding
 /// core.
-private let freestandingLibrarySourceRoot = hostedLibrarySourceRoot.appendingPathComponent("Core")
+public let freestandingLibrarySourceRoot = hostedLibrarySourceRoot.appendingPathComponent("Core")
 
 extension Utils.Host {
 
