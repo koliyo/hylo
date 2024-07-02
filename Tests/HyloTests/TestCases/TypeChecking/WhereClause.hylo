@@ -5,10 +5,10 @@ type A<X>: Deinitializable {
 }
 
 extension A where X == Bool {
-  fun koala() {}
+  public fun koala() {}
 }
 
 public fun main() {
   A<Bool>().koala()
-  A<Int8>().koala() //! diagnostic unsatisfied where clause
+  A<Int8>().koala() //! diagnostic reference to 'koala' requires that 'Int8' be equal to 'Bool'
 }

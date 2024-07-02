@@ -1,4 +1,3 @@
-import Core
 import Utils
 
 /// A type whose instances can be updated without loss of information.
@@ -13,7 +12,9 @@ protocol Monotonic: Equatable {
 extension Monotonic where Self: Equatable {
 
   /// Asserts that `self == other`.
-  func updateMonotonically(_ other: Self) { assert(self == other) }
+  func updateMonotonically(_ other: Self) {
+    assert(self == other, "non-monotonic update of \(type(of: self))")
+  }
 
 }
 
@@ -89,3 +90,5 @@ extension Memo: Monotonic where T: Monotonic {
   }
 
 }
+
+extension FunctionAttributes: Monotonic {}

@@ -1,5 +1,5 @@
-import Core
 import Driver
+import FrontEnd
 import Utils
 import XCTest
 
@@ -9,7 +9,7 @@ extension Diagnostic {
   fileprivate var expectation: TestAnnotation {
     TestAnnotation(
       in: site.file.url,
-      atLine: site.first().line.number,
+      atLine: site.start.line.number,
       parsing: "diagnostic " + message
     )
   }
@@ -99,6 +99,7 @@ extension XCTestCase {
   ///   - expectSuccess: true if an error from `process` represents a test failure, false if the
   ///     lack of an error represents a test failure; nil if that information is to be derived
   ///     from the contents of the file.
+  @nonobjc
   public func checkAnnotatedHyloFileDiagnostics(
     inFileAt hyloFilePath: String,
     expectSuccess: Bool,
@@ -163,17 +164,68 @@ extension XCTestCase {
     return testFailures
   }
 
-  /// Compiles and runs the hylo file at `hyloFilePath`, `XCTAssert`ing that diagnostics and exit
-  /// codes match annotated expectations.
+  /// Calls `compileAndRun(hyloFilePath, withOptimizations: false, expectSuccess: expectSuccess)`.
+  @nonobjc
   public func compileAndRun(_ hyloFilePath: String, expectSuccess: Bool) throws {
+    try compileAndRun(hyloFilePath, withOptimizations: false, expectSuccess: expectSuccess)
+  }
+
+  /// Calls `compileAndRun(hyloFilePath, withOptimizations: true, expectSuccess: expectSuccess)`.
+  @nonobjc
+  public func compileAndRunWithOptimizations(_ hyloFilePath: String, expectSuccess: Bool) throws {
+    try compileAndRun(hyloFilePath, withOptimizations: true, expectSuccess: expectSuccess)
+  }
+
+  /// Compiles and runs the hylo file at `hyloFilePath`, applying program optimizations iff
+  /// `withOptimizations` is `true`, and `XCTAssert`ing that diagnostics and exit codes match
+  /// annotated expectations.
+  @nonobjc
+  public func compileAndRun(
+    _ hyloFilePath: String, withOptimizations: Bool, expectSuccess: Bool
+  ) throws {
+    if swiftyLLVMMandatoryPassesCrash { return }
+    try checkAnnotatedHyloFileDiagnostics(
+      inFileAt: hyloFilePath, expectSuccess: expectSuccess
+    ) { (hyloSource, diagnostics) in
+      try compileAndRun(
+        hyloSource, withOptimizations: withOptimizations, reportingDiagnosticsTo: &diagnostics)
+    }
+  }
+
+  /// Compiles and runs `hyloSource`, applying program optimizations iff `withOptimizations` is
+  /// `true`, and `XCTAssert`ing that diagnostics and exit codes match annotated expectations.
+  private func compileAndRun(
+    _ hyloSource: SourceFile, withOptimizations: Bool,
+    reportingDiagnosticsTo diagnostics: inout DiagnosticSet
+  ) throws {
+    var arguments = ["--emit", "binary"]
+    if withOptimizations { arguments.append("-O") }
+
+    var executable: URL
+    do {
+      executable = try compile(hyloSource.url, with: arguments)
+    } catch let d as DiagnosticSet {
+      // Recapture the diagnostics so the annotation testing framework can use them.  The need for
+      // this ugliness makes me wonder how important it is to test cli.execute, which after all is
+      // just a thin wrapper over cli.executeCommand (currently private).
+      diagnostics = d
+      throw d
+    }
+
+    // discard any outputs.
+    _ = try Process.run(executable, arguments: [])
+  }
+
+  /// Compiles the hylo file at `hyloFilePath` up until emitting LLVM code, `XCTAssert`ing that diagnostics and exit
+  /// codes match annotated expectations.
+  @nonobjc
+  public func compileToLLVM(_ hyloFilePath: String, expectSuccess: Bool) throws {
     if swiftyLLVMMandatoryPassesCrash { return }
     try checkAnnotatedHyloFileDiagnostics(inFileAt: hyloFilePath, expectSuccess: expectSuccess) {
       (hyloSource, diagnostics) in
 
-      var executable: URL
-
       do {
-        executable = try compile(hyloSource.url, with: ["--emit", "binary"])
+        let _ = try compile(hyloSource.url, with: ["--emit", "llvm"])
       } catch let d as DiagnosticSet {
         // Recapture the diagnostics so the annotation testing framework can use them.  The need for
         // this ugliness makes me wonder how important it is to test cli.execute, which after all is
@@ -181,14 +233,12 @@ extension XCTestCase {
         diagnostics = d
         throw d
       }
-
-      // discard any outputs.
-      _ = try Process.run(executable, arguments: [])
     }
   }
 
   /// Compiles `input` with the given arguments and returns the URL of the output file, throwing
   /// diagnostics if there are any errors.
+  @nonobjc
   public func compile(_ input: URL, with arguments: [String]) throws -> URL {
     let output = FileManager.default.makeTemporaryFileURL()
     let cli = try Driver.parse(arguments + ["-o", output.relativePath, input.relativePath])

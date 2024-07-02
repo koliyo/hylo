@@ -1,6 +1,6 @@
 //- typeCheck expecting: success
 
-type M<T> {
+type M<T: Deinitializable> {
   public var x: T
   public memberwise init
 
@@ -20,5 +20,5 @@ type M<T> {
 }
 
 fun test(x: M<Int>) -> Int {
-  return &x.f().g()
+  &x.f().g()
 }

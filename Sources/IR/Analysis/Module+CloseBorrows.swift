@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 import Utils
 
 extension Module {
@@ -74,7 +74,7 @@ extension Module {
 
       case .start(let b):
         let site = instructions(in: b).first.map(default: self[i].site) {
-          SourceRange.empty(at: self[$0].site.first())
+          SourceRange.empty(at: self[$0].site.start)
         }
         let s = make(&self, site)
         insert(s, at: boundary)

@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 import Utils
 
 /// Invokes `callee` with `arguments` and writes its result to `output`.
@@ -69,7 +69,7 @@ extension Module {
     applying callee: Operand, to arguments: [Operand], writingResultTo output: Operand,
     at site: SourceRange
   ) -> Call {
-    let t = LambdaType(type(of: callee).ast)!.strippingEnvironment
+    let t = ArrowType(type(of: callee).ast)!.strippingEnvironment
     precondition(t.inputs.count == arguments.count)
     precondition(arguments.allSatisfy({ self[$0] is Access }))
     precondition(isBorrowSet(output))

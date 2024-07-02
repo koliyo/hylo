@@ -1,9 +1,9 @@
 /// A signed integer value.
 public type Int {
 
-  var value: Builtin.word
+  internal var value: Builtin.word
 
-  memberwise init
+  internal memberwise init
 
   /// Creates an instance with the same memory representation as `other`.
   public init(bit_pattern other: UInt) {
@@ -34,6 +34,11 @@ public type Int {
     }
 
     return self + stride - r
+  }
+
+  /// Returns the smallest power of two that is not smaller than `self`.
+  public fun round_up_nearest_power_two() -> Int {
+    if self == 1 { 1 } else { 1 << (Self.bit_width() - (self - 1).leading_zeros()) }
   }
 
   /// Returns `self`.
@@ -258,6 +263,14 @@ public conformance Int: BinaryInteger {
 
 }
 
+public conformance Int: SignedInteger {
+
+  public fun successor() -> Self {
+    self + 1
+  }
+
+}
+
 public conformance Int: FixedWidthInteger {
 
   public fun matches(_ mask: Self) -> Bool {
@@ -339,6 +352,20 @@ public conformance Int: FixedWidthInteger {
 
   public static fun min() -> Self {
     Int(value: Builtin.shl_word((1).value, (bit_width() - 1).value))
+  }
+
+}
+
+public conformance Int: Strideable {
+
+  public typealias Stride = Int
+
+  public fun offset(to other: Self) -> Int {
+    other - self
+  }
+
+  public fun advance(by offset: Int) -> Self {
+    self + offset
   }
 
 }

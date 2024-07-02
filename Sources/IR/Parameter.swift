@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 
 /// The possibly synthetic declaration of a parameter to a Hylo IR function.
 public struct Parameter {
@@ -25,7 +25,7 @@ public struct Parameter {
     case let u as RemoteType:
       self.init(decl: d, type: ParameterType(u))
     default:
-      self.init(decl: d, type: ParameterType(.sink, t))
+      self.init(decl: d, type: ParameterType(.inout, t))
     }
   }
 

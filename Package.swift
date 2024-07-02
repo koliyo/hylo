@@ -1,4 +1,4 @@
-// swift-tools-version:5.7
+// swift-tools-version:5.10
 import Foundation
 import PackageDescription
 
@@ -13,7 +13,10 @@ let allTargetsSwiftSettings: [SwiftSetting] = [
   .unsafeFlags(["-warnings-as-errors"])
 ]
 
-/// Most people don't need this; set it in your environment if you do.
+/// Dependencies for documentation extraction.
+///
+/// Most people don't need to extract documentation; set `HYLO_ENABLE_DOC_GENERATION` in your
+/// environment if you do.
 let docGenerationDependency: [Package.Dependency] =
   ProcessInfo.processInfo.environment["HYLO_ENABLE_DOC_GENERATION"] != nil
   ? [.package(url: "https://github.com/apple/swift-docc-plugin.git", from: "1.1.0")] : []
@@ -22,14 +25,15 @@ let package = Package(
   name: "Hylo",
 
   platforms: [
-    .macOS(.v13)
+    .macOS(.v12)
   ],
 
   products: [
     .executable(name: "hc", targets: ["hc"]),
     .executable(name: "hylo-demangle", targets: ["hylo-demangle"]),
-    .library(name: "Hylo", targets: ["Driver"]),
-    .library(name: "HyloFrontEnd", targets: ["StandardLibrary"]),
+    // .library(name: "Hylo", targets: ["Driver"]),
+    .library(name: "hylo-stdlib", targets: ["StandardLibrary"]),
+    .library(name: "FrontEnd", targets: ["FrontEnd"]),
   ],
 
   dependencies: [
@@ -39,6 +43,9 @@ let package = Package(
     .package(
       url: "https://github.com/apple/swift-collections.git",
       from: "1.0.0"),
+    .package(
+      url: "https://github.com/apple/swift-algorithms.git",
+      from: "1.2.0"),
     .package(
       url: "https://github.com/hylo-lang/Durian.git",
       from: "1.2.0"),
@@ -89,33 +96,25 @@ let package = Package(
       name: "FrontEnd",
       dependencies: [
         "Utils",
-        "Core",
         .product(name: "Collections", package: "swift-collections"),
         .product(name: "Durian", package: "Durian"),
         .product(name: "BigInt", package: "BigInt"),
-      ],
-      swiftSettings: allTargetsSwiftSettings),
-
-    .target(
-      name: "Core",
-      dependencies: [
-        "Utils",
-        .product(name: "Collections", package: "swift-collections"),
+        .product(name: "SwiftyLLVM", package: "Swifty-LLVM"),
       ],
       swiftSettings: allTargetsSwiftSettings),
 
     .target(
       name: "IR",
-      dependencies: ["Utils", "Core", "FrontEnd"],
+      dependencies: ["Utils", "FrontEnd"],
       swiftSettings: allTargetsSwiftSettings),
 
     .target(
       name: "CodeGenLLVM",
       dependencies: [
-        "Core",
+        "FrontEnd",
         "IR",
         "Utils",
-        .product(name: "LLVM", package: "Swifty-LLVM"),
+        .product(name: "SwiftyLLVM", package: "Swifty-LLVM"),
       ],
       path: "Sources/CodeGen/LLVM",
       swiftSettings: allTargetsSwiftSettings),
@@ -125,12 +124,13 @@ let package = Package(
       dependencies: [
         .product(name: "BigInt", package: "BigInt"),
         .product(name: "Collections", package: "swift-collections"),
+        .product(name: "Algorithms", package: "swift-algorithms"),
       ],
       swiftSettings: allTargetsSwiftSettings),
 
     .target(
       name: "TestUtils",
-      dependencies: ["Core", "Driver", "Utils"],
+      dependencies: ["FrontEnd", "Driver", "Utils"],
       swiftSettings: allTargetsSwiftSettings),
 
     .target(
@@ -151,12 +151,12 @@ let package = Package(
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
         "Utils",
       ],
-      swiftSettings: allTargetsSwiftSettings + [.unsafeFlags(["-parse-as-library"])]),
+      swiftSettings: allTargetsSwiftSettings),
 
     // Test targets.
     .testTarget(
       name: "UtilsTests",
-      dependencies: ["Utils"],
+      dependencies: ["Utils", .product(name: "Algorithms", package: "swift-algorithms")],
       swiftSettings: allTargetsSwiftSettings),
 
     .testTarget(
@@ -166,12 +166,15 @@ let package = Package(
 
     .testTarget(
       name: "ManglingTests",
-      dependencies: ["Core", "FrontEnd", "IR", "TestUtils", "StandardLibrary"],
+      dependencies: ["FrontEnd", "IR", "TestUtils", "StandardLibrary"],
       swiftSettings: allTargetsSwiftSettings),
 
     .testTarget(
       name: "HyloTests",
-      dependencies: ["Core", "FrontEnd", "IR", "TestUtils", "StandardLibrary"],
+      dependencies: [
+        "FrontEnd", "IR", "TestUtils", "StandardLibrary", "Utils",
+        .product(name: "Algorithms", package: "swift-algorithms"),
+      ],
       exclude: ["TestCases"],
       swiftSettings: allTargetsSwiftSettings,
       plugins: ["TestGeneratorPlugin"]),

@@ -1,5 +1,5 @@
-import Core
 import DequeModule
+import FrontEnd
 import Utils
 
 extension Module {
@@ -66,6 +66,8 @@ extension Module {
           pc = interpret(load: user, in: &context)
         case is MarkState:
           pc = interpret(markState: user, in: &context)
+        case is MemoryCopy:
+          pc = interpret(memoryCopy: user, in: &context)
         case is Move:
           pc = interpret(move: user, in: &context)
         case is OpenCapture:
@@ -127,7 +129,8 @@ extension Module {
         if p.isEmpty { break }
 
         insertDeinit(
-          s.source, at: p, anchoredTo: s.site, before: i, reportingDiagnosticsTo: &diagnostics)
+          s.source, at: p, before: i,
+          anchoringInstructionsTo: s.site, reportingDiagnosticsTo: &diagnostics)
         o.value = .full(.uninitialized)
         context.forEachObject(at: s.source, { $0 = o })
 
@@ -184,7 +187,7 @@ extension Module {
     func interpret(call i: InstructionID, in context: inout Context) -> PC? {
       let s = self[i] as! Call
       let f = s.callee
-      let callee = LambdaType(type(of: f).ast)!
+      let callee = ArrowType(type(of: f).ast)!
 
       // Evaluate the callee.
 
@@ -249,8 +252,8 @@ extension Module {
 
       case .sink:
         insertDeinit(
-          s.start, at: projection.value.initializedSubfields, anchoredTo: s.site, before: i,
-          reportingDiagnosticsTo: &diagnostics)
+          s.start, at: projection.value.initializedSubfields, before: i,
+          anchoringInstructionsTo: s.site, reportingDiagnosticsTo: &diagnostics)
         context.withObject(at: l, { $0.value = .full(.uninitialized) })
 
       case .yielded:
@@ -303,8 +306,8 @@ extension Module {
       // erasing the deallocated memory from the context.
       let p = context.withObject(at: l, \.value.initializedSubfields)
       insertDeinit(
-        s.location, at: p, anchoredTo: s.site, before: i,
-        reportingDiagnosticsTo: &diagnostics)
+        s.location, at: p, before: i,
+        anchoringInstructionsTo: s.site, reportingDiagnosticsTo: &diagnostics)
       context.memory[l] = nil
       return successor(of: i)
     }
@@ -364,13 +367,25 @@ extension Module {
     func interpret(markState i: InstructionID, in context: inout Context) -> PC? {
       let s = self[i] as! MarkState
 
-      let locations = context.locals[s.storage]!.unwrapLocations()!
-      for l in locations {
-        context.withObject(at: l) { (o) in
-          o.value = .full(s.initialized ? .initialized : .uninitialized)
+      // Built-in values are never consumed.
+      let isBuiltin = type(of: s.storage).ast.isBuiltin
+
+      context.forEachObject(at: s.storage) { (o) in
+        if s.initialized {
+          o.value = .full(.initialized)
+        } else if !isBuiltin {
+          // `mark_state` is treated as a consumer so that we can detect and diagnose escapes.
+          o.value = .full(.consumed(by: [i]))
         }
       }
 
+      return successor(of: i)
+    }
+
+    /// Interprets `i` in `context`, reporting violations into `diagnostics`.
+    func interpret(memoryCopy i: InstructionID, in context: inout Context) -> PC? {
+      let s = self[i] as! MemoryCopy
+      initialize(s.target, in: &context)
       return successor(of: i)
     }
 
@@ -439,17 +454,22 @@ extension Module {
     func interpret(return i: InstructionID, in context: inout Context) -> PC? {
       // Make sure that all non-sink parameters are initialized on exit.
       let entry = entry(of: f)!
-      for (i, p) in self[f].inputs.enumerated() where p.type.access != .sink {
-        ensureInitializedOnExit(
-          .parameter(entry, i), passed: p.type.access, in: &context,
-          reportingDiagnosticsAt: diagnosticSite(for: p, in: f))
+      for (k, p) in self[f].inputs.enumerated() {
+        let source = Operand.parameter(entry, k)
+        if p.type.access == .sink {
+          ensureUninitializedOnExit(
+            source, in: &context, insertingDeinitializationBefore: i,
+            reportingDiagnosticsAt: self[i].site)
+        } else {
+          ensureInitializedOnExit(
+            source, passed: p.type.access, in: &context,
+            reportingDiagnosticsAt: diagnosticSite(for: p, in: f))
+        }
       }
 
       // Make sure that the return value is initialized on exit.
       if !self[f].isSubscript {
-        ensureInitializedOnExit(
-          .parameter(entry, self[f].inputs.count), passed: .set, in: &context,
-          reportingDiagnosticsAt: .empty(at: self[f].site.first()))
+        ensureReturnValueIsInitialized(in: &context, at: self[i].site)
       }
 
       return successor(of: i)
@@ -557,26 +577,52 @@ extension Module {
       context.withObject(at: .root(p)) { (o) in
         if o.value == .full(.initialized) { return }
 
-        if k == .set {
-          // If the parameter is a return value (index == 0) we emit specialized diagnostics.
-          if case .parameter(_, 0) = p {
-            let t = self[f].output
-            if !t.isVoidOrNever {
-              diagnostics.insert(
-                .missingFunctionReturn(expectedReturnType: t, at: site)
-              )
-              return
-            }
-          }
-          diagnostics.insert(
-            .uninitializedSetParameter(beforeReturningFrom: f, in: self, at: site))
-          return
-        }
-
         // If the parameter is `let` or `inout`, it's been (partially) consumed since it was
         // initialized in the entry context.
-        diagnostics.insert(
-          .illegalParameterEscape(consumedBy: o.value.consumers, in: self, at: site))
+        if k == .set {
+          diagnostics.insert(
+            .uninitializedSetParameter(beforeReturningFrom: f, in: self, at: site))
+        } else {
+          diagnostics.insert(
+            .illegalParameterEscape(consumedBy: o.value.consumers, in: self, at: site))
+        }
+      }
+    }
+
+    /// Checks that entry parameter `p` is deinitialized in `context`, inserting definitialization
+    /// before instruction `i` if it isn't, reporting diagnostics at `site`.
+    func ensureUninitializedOnExit(
+      _ p: Operand, in context: inout Context,
+      insertingDeinitializationBefore i: InstructionID,
+      reportingDiagnosticsAt site: SourceRange
+    ) {
+      context.withObject(at: .root(p), { (o) in
+        let s = o.value.initializedSubfields
+        if s == [[]] && isDeinit(i.function) {
+          // We cannot call `deinit` in `deinit` itself.
+          insertDeinitParts(
+            of: p, before: i,
+            anchoringInstructionsTo: site, reportingDiagnosticsTo: &diagnostics)
+        } else {
+          insertDeinit(
+            p, at: s, before: i,
+            anchoringInstructionsTo: site, reportingDiagnosticsTo: &diagnostics)
+        }
+
+        o.value = .full(.uninitialized)
+      })
+    }
+
+    /// Checks that the return value is initialized in `context`.
+    func ensureReturnValueIsInitialized(
+      in context: inout Context, at site: SourceRange
+    ) {
+      let p = returnValue(of: f)!
+      let isInitialized = context.withObject(at: .root(p)) { (o) in
+        o.value == .full(.initialized)
+      }
+      if !isInitialized {
+        diagnostics.insert(.missingReturn(inFunctionReturning: self[f].output, at: site))
       }
     }
 
@@ -607,11 +653,13 @@ extension Module {
 
       switch access {
       case .let, .inout:
+        assert(projection.value == .full(.initialized) || !projection.value.consumers.isEmpty)
         for c in projection.value.consumers {
           diagnostics.insert(.error(cannotConsume: access, at: self[c].site))
         }
 
       case .set:
+        assert(projection.value == .full(.initialized) || !projection.value.consumers.isEmpty)
         for c in projection.value.consumers {
           diagnostics.insert(.error(cannotConsume: access, at: self[c].site))
         }
@@ -621,8 +669,8 @@ extension Module {
 
       case .sink:
         insertDeinit(
-          start, at: projection.value.initializedSubfields, anchoredTo: self[exit].site,
-          before: exit, reportingDiagnosticsTo: &diagnostics)
+          start, at: projection.value.initializedSubfields, before: exit,
+          anchoringInstructionsTo: self[exit].site, reportingDiagnosticsTo: &diagnostics)
         context.withObject(at: l, { $0.value = .full(.uninitialized) })
 
       case .yielded:
@@ -704,8 +752,9 @@ extension Module {
   /// Inserts IR for the deinitialization of `root` at given `initializedSubfields` before
   /// instruction `i`, anchoring instructions to `site`.
   private mutating func insertDeinit(
-    _ root: Operand, at initializedSubfields: [RecordPath], anchoredTo site: SourceRange,
-    before i: InstructionID, reportingDiagnosticsTo log: inout DiagnosticSet
+    _ root: Operand, at initializedSubfields: [RecordPath], before i: InstructionID,
+    anchoringInstructionsTo site: SourceRange,
+    reportingDiagnosticsTo log: inout DiagnosticSet
   ) {
     for path in initializedSubfields {
       Emitter.withInstance(insertingIn: &self, reportingDiagnosticsTo: &log) { (e) in
@@ -716,9 +765,22 @@ extension Module {
     }
   }
 
+  /// Inserts ID for the deinitialization of `whole`'s parts before instruction `i`, anchoring
+  /// new instructions to `site`.
+  private mutating func insertDeinitParts(
+    of whole: Operand, before i: InstructionID,
+    anchoringInstructionsTo site: SourceRange,
+    reportingDiagnosticsTo log: inout DiagnosticSet
+  ) {
+    Emitter.withInstance(insertingIn: &self, reportingDiagnosticsTo: &log) { (e) in
+      e.insertionPoint = .before(i)
+      e.emitDeinitParts(of: whole, at: site)
+    }
+  }
+
   /// Returns the site at which diagnostics related to the parameter `p` should be reported in `f`.
   private func diagnosticSite(for p: Parameter, in f: Function.ID) -> SourceRange {
-    guard let d = p.decl else { return .empty(at: self[f].site.first()) }
+    guard let d = p.decl else { return .empty(at: self[f].site.start) }
     switch d.kind {
     case ParameterDecl.self:
       return program.ast[ParameterDecl.ID(d)!].identifier.site
@@ -1025,8 +1087,8 @@ extension Diagnostic {
     .error("use of uninitialized object", at: site)
   }
 
-  fileprivate static func missingFunctionReturn(
-    expectedReturnType: AnyType,
+  fileprivate static func missingReturn(
+    inFunctionReturning expectedReturnType: AnyType,
     at site: SourceRange
   ) -> Diagnostic {
     .error("missing return in function expected to return '\(expectedReturnType)'", at: site)

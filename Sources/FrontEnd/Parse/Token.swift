@@ -1,5 +1,3 @@
-import Core
-
 /// A terminal symbol of the syntactic grammar.
 public struct Token {
 
@@ -38,15 +36,11 @@ public struct Token {
     case `infix`
     case `init`
     case `inout`
+    case `internal`
     case `let`
     case `match`
     case `namespace`
-    case `nil`
     case `operator`
-    case `poundElse`
-    case `poundElseif`
-    case `poundEndif`
-    case `poundIf`
     case `postfix`
     case `prefix`
     case `property`
@@ -69,6 +63,11 @@ public struct Token {
     case `while`
     case `yield`
     case `yielded`
+
+    case `poundElse`
+    case `poundElseif`
+    case `poundEndif`
+    case `poundIf`
 
     // Attributes
     case attribute = 4000

@@ -1,4 +1,3 @@
-import Core
 import OrderedCollections
 import Utils
 
@@ -80,10 +79,10 @@ struct TypeChecker {
     if t[.isCanonical] { return t }
 
     switch t.base {
-    case let u as TypeAliasType:
-      return canonical(u.aliasee.value, in: scopeOfUse)
     case let u as BoundGenericType:
       return canonical(u, in: scopeOfUse)
+    case let u as TypeAliasType:
+      return canonical(u.aliasee.value, in: scopeOfUse)
     case let u as UnionType:
       return canonical(u, in: scopeOfUse)
     default:
@@ -96,7 +95,7 @@ struct TypeChecker {
     if t[.isCanonical] { return ^t }
 
     let b = canonical(t.base, in: scopeOfUse)
-    let a = canonical(t.arguments, in: scopeOfUse)
+    let a = canonical(GenericArguments(t), in: scopeOfUse)
     let s = specialize(b, for: a, in: scopeOfUse)
     return canonical(s, in: scopeOfUse)
   }
@@ -130,43 +129,66 @@ struct TypeChecker {
     arguments.mapValues({ canonical($0, in: scopeOfUse) })
   }
 
-  /// Returns `true` iff `t` and `u` are equivalent types in `scopeOfUse`.
+  /// Returns `true` iff `t` and `u` are semantically equivalent in `scopeOfUse`.
   mutating func areEquivalent(_ t: AnyType, _ u: AnyType, in scopeOfUse: AnyScopeID) -> Bool {
-    canonical(t, in: scopeOfUse) == canonical(u, in: scopeOfUse)
+    if let a = GenericTypeParameterType(t) {
+      return areEquivalent(a, u, in: scopeOfUse)
+    } else if !t[.isCanonical] {
+      return areEquivalent(u, canonical(t, in: scopeOfUse), in: scopeOfUse)
+    } else {
+      return t == canonical(u, in: scopeOfUse)
+    }
+  }
+
+  /// Returns `true` iff `t` and `u` are semantically equivalent in `scopeOfUse`.
+  mutating func areEquivalent(
+    _ t: GenericTypeParameterType, _ u: AnyType, in scopeOfUse: AnyScopeID
+  ) -> Bool {
+    let b = canonical(u, in: scopeOfUse)
+    let e = environment(of: program[t.decl].scope)!
+    return e.areEquivalent(^t, b) || (t == u)
   }
 
   /// Returns `true` iff `t` is a refinement of `u` and `t != u`.
   mutating func isStrictRefinement(_ t: TraitType, of u: TraitType) -> Bool {
-    (t != u) && refinements(of: t).contains(u)
+    (t != u) && bases(of: t).contains(u)
   }
 
-  /// Returns the traits refining `t`, reporting a diagnostic if one of them is in `refinedTraits`.
+  /// Returns the traits which `t` refines, reporting a cycle if one of them is in `bases`.
   ///
-  /// `refinedTraits` serves as a memo to catch refinement cycles and is expected to be empty
-  /// unless `refinements(of:knownToRefine:)` is called recursively.
-  private mutating func refinements(
-    of t: TraitType, knownToRefine refinedTraits: Set<TraitType> = []
-  ) -> RefinementCluster {
-    if let r = cache.traitToRefinements[t] { return r }
+  /// `knownBases` serves as a memo to catch refinement cycles and is expected to be empty except
+  /// in recursive calls to `bases(of:knownBases:)`.
+  private mutating func bases(
+    of t: TraitType, knownToRefine knownBases: Set<TraitType> = []
+  ) -> RefinementClosure {
+    if let r = cache.traitToBases[t] { return r }
 
-    let knownRefinedTraits = refinedTraits.inserting(t)
-    var result = RefinementCluster(t)
+    let newKnownBases = knownBases.inserting(t)
+    var result = RefinementClosure(t)
 
-    for (n, s) in evalTraitComposition(program[t.decl].refinements) {
-      if knownRefinedTraits.contains(s) {
+    for (n, s) in evalTraitComposition(program[t.decl].bounds) {
+      if newKnownBases.contains(s) {
         report(.error(circularRefinementAt: program[n].site))
       } else {
-        let newRefinements = refinements(of: s, knownToRefine: knownRefinedTraits)
-        result.insert(newRefinements, refining: t)
+        let newBases = bases(of: s, knownToRefine: newKnownBases)
+        result.insert(newBases, inheritedBy: t)
       }
     }
 
-    cache.traitToRefinements[t] = result
+    cache.traitToBases[t] = result
     return result
   }
 
   /// Returns the traits to which `t` is declared conforming in `scopeOfUse`.
-  mutating func conformedTraits(of t: AnyType, in scopeOfUse: AnyScopeID) -> Set<TraitType> {
+  mutating func conformedTraits(
+    of t: AnyType, in scopeOfUse: AnyScopeID
+  ) -> Set<TraitType> {
+    // Computation is not memoized for generic type parameters because queries might come from
+    // generic arguments under construction.
+    if let u = GenericTypeParameterType(t) {
+      return conformedTraits(of: u, in: scopeOfUse)
+    }
+
     let key = Cache.TypeLookupKey(t, in: scopeOfUse)
     if let r = cache.typeToConformedTraits[key] {
       return r
@@ -180,12 +202,10 @@ struct TypeChecker {
       result = conformedTraits(of: u.base, in: scopeOfUse)
     case let u as BuiltinType:
       result = conformedTraits(of: u, in: scopeOfUse)
-    case let u as GenericTypeParameterType:
-      result = conformedTraits(of: u, in: scopeOfUse)
     case let u as ProductType:
       result = conformedTraits(of: u, in: scopeOfUse)
     case let u as TraitType:
-      result = refinements(of: u).unordered
+      result = bases(of: u).unordered
     case let u as TypeAliasType:
       result = conformedTraits(of: u.resolved, in: scopeOfUse)
     case let u as WitnessType:
@@ -202,9 +222,54 @@ struct TypeChecker {
   private mutating func conformedTraits(
     of t: AssociatedTypeType, in scopeOfUse: AnyScopeID
   ) -> Set<TraitType> {
-    var result = conformedTraits(declaredByConstraintsOn: ^t, exposedTo: scopeOfUse)
+    var result = Set<TraitType>()
+    accumulateConformedTraits(declaredInTraitsRequiring: t, suffixedBy: [], in: &result)
+    result.formUnion(conformedTraits(declaredByConstraintsOn: ^t, exposedTo: scopeOfUse))
     result.formUnion(conformedTraits(declaredInExtensionsOf: ^t, exposedTo: scopeOfUse))
     return result
+  }
+
+  /// Gathers the traits to which the associated type identified by `base` and `suffix` conform.
+  ///
+  /// The traits to which an associated type conforms can be declared in the trait introducing it
+  /// as well as any of the trait defining its qualification. For example, given a type `T.X.Y`, a
+  /// a conformance `X.Y: P` could be declared in the trait introducing `X`. Hence, to collect all
+  /// possible traits, one must gather the conformances of `Y` in the trait defining `Y` **and**
+  /// the conformances of `X.Y` in the traits defining `X`.
+  ///
+  /// `base` is the qualification of the associated type composed of `suffix` in reverse order. For
+  /// example, the base `T.X` and suffix `[Z, Y]` denote the associated type `T.X.Y.Z`.
+  private mutating func accumulateConformedTraits(
+    declaredInTraitsRequiring base: AssociatedTypeType,
+    suffixedBy suffix: [AssociatedTypeDecl.ID],
+    in accumulator: inout Set<TraitType>
+  ) {
+    // Gather the conformances declared in the trait definition `t`.
+    var definition = MetatypeType(uncheckedType(of: base.decl))!.instance
+    for a in suffix.reversed() {
+      definition = ^AssociatedTypeType(a, domain: definition, ast: program.ast)
+    }
+
+    let d = TraitDecl.ID(program[base.decl].scope)!
+    let e = possiblyPartiallyFormedEnvironment(of: AnyDeclID(d))!
+    accumulator.formUnion(e.conformedTraits(of: definition))
+
+    // Gather the conformances declared as associated type constraints in the traits defining the
+    // domain of `t`.
+    switch base.domain.base {
+    case is GenericTypeParameterType:
+      break
+
+    case let u as AssociatedTypeType:
+      accumulateConformedTraits(
+        declaredInTraitsRequiring: u, suffixedBy: suffix + [base.decl], in: &accumulator)
+
+    case is ConformanceLensType:
+      UNIMPLEMENTED("name lookup into conformance lenses")
+
+    default:
+      unreachable("unexpected associated type domain '\(base.domain)'")
+    }
   }
 
   /// Returns the traits to which `t` is declared conforming in `scopeOfUse`.
@@ -224,10 +289,15 @@ struct TypeChecker {
   private mutating func conformedTraits(
     of t: GenericTypeParameterType, in scopeOfUse: AnyScopeID
   ) -> Set<TraitType> {
+    let scopeOfDeclaration = program[t.decl].scope
+
     // Trait receivers conform to their traits.
     var result: Set<TraitType>
-    if let d = TraitDecl.ID(program[t.decl].scope) {
-      result = refinements(of: TraitType(d, ast: program.ast)).unordered
+    if let d = TraitDecl.ID(scopeOfDeclaration) {
+      result = bases(of: TraitType(d, ast: program.ast)).unordered
+    } else if !isNotionallyContained(scopeOfUse, in: scopeOfDeclaration) {
+      let e = possiblyPartiallyFormedEnvironment(of: AnyDeclID(scopeOfDeclaration)!)!
+      result = e.conformedTraits(of: ^t)
     } else {
       result = []
     }
@@ -243,7 +313,7 @@ struct TypeChecker {
   ) -> Set<TraitType> {
     var result = Set<TraitType>()
     for (_, u) in evalTraitComposition(program[t.decl].conformances) {
-      result.formUnion(refinements(of: u).unordered)
+      result.formUnion(bases(of: u).unordered)
     }
 
     result.formUnion(conformedTraits(declaredInExtensionsOf: ^t, exposedTo: scopeOfUse))
@@ -257,7 +327,7 @@ struct TypeChecker {
     switch t.container.interface {
     case .traits(let traits):
       return traits.reduce(into: []) { (result, u) in
-        result.formUnion(refinements(of: u).unordered)
+        result.formUnion(bases(of: u).unordered)
       }
 
     default:
@@ -273,7 +343,7 @@ struct TypeChecker {
     var result = Set<TraitType>()
     for e in extensions(of: t, exposedTo: scopeOfUse).filter(ConformanceDecl.self) {
       for (_, u) in evalTraitComposition(program[e].conformances) {
-        result.formUnion(refinements(of: u).unordered)
+        result.formUnion(bases(of: u).unordered)
       }
     }
     return result
@@ -282,31 +352,103 @@ struct TypeChecker {
   /// Returns the traits to which `t` is declared conforming in its generic environment.
   ///
   /// `t` is a generic type parameter or an associated type introduced by a generic environment
-  /// logically containing `scopeOfUse`. The return value is the set of traits used as bounds of
+  /// notionally containing `scopeOfUse`. The return value is the set of traits used as bounds of
   /// `t` in that environment.
-  mutating func conformedTraits(
+  private mutating func conformedTraits(
     declaredByConstraintsOn t: AnyType, exposedTo scopeOfUse: AnyScopeID
   ) -> Set<TraitType> {
-    var result = Set<TraitType>()
-    for s in program.scopes(from: scopeOfUse) where s.kind.value is GenericScope.Type {
-      let d = AnyDeclID(s)!
-
-      // If an environment has been computed already, use it.
-      if let e = cache.read(\.environment[d]) {
-        result.formUnion(e.conformedTraits(of: ^t))
-      } else {
-        // TODO
-      }
-
-      // Note: `s` might be extending the type whose declaration introduced the generic environment
-      // that declared `t`.
-      if s.kind.value is TypeExtendingDecl.Type {
-        if let g = environment(introducedByDeclOf: uncheckedType(of: d)) {
-          result.formUnion(g.conformedTraits(of: ^t))
-        }
-      }
+    if let s = program.scopes(from: scopeOfUse).first(where: \.isGenericScope) {
+      let e = possiblyPartiallyFormedEnvironment(of: AnyDeclID(s)!)!
+      return e.conformedTraits(of: ^t)
+    } else {
+      return []
     }
-    return result
+  }
+
+  /// Returns `true` if `model` conforms to `trait` explicitly or structurally in `scopeOfUse`.
+  mutating func conforms(
+    _ model: AnyType, to trait: TraitType, in scopeOfUse: AnyScopeID
+  ) -> Bool {
+    conformedTraits(of: model, in: scopeOfUse).contains(trait)
+      || structurallyConforms(model, to: trait, in: scopeOfUse)
+  }
+
+  /// Returns `true` if `model` structurally conforms to `trait` in `scopeOfUse`.
+  ///
+  /// Given a trait describing basis operations (e.g., copy) of values, a structural conformance
+  /// *M: T* holds iff all the stored parts of *M* conform to *T*, structurally or otherwise. In
+  /// that case, the conformance can be synthesized because its implementation is obvious.
+  private mutating func structurallyConforms(
+    _ model: AnyType, to trait: TraitType, in scopeOfUse: AnyScopeID
+  ) -> Bool {
+    switch model.base {
+    case is BoundGenericType:
+      let m = canonical(model, in: scopeOfUse)
+      return !(m.base is BoundGenericType) && structurallyConforms(m, to: trait, in: scopeOfUse)
+    case let m as BufferType:
+      // FIXME: To remove once conditional conformance is implemented
+      return conforms(m.element, to: trait, in: scopeOfUse)
+    case let m as ArrowType:
+      return conforms(m.environment, to: trait, in: scopeOfUse)
+    case is MetatypeType:
+      return true
+    case let m as RemoteType:
+      return conforms(m.bareType, to: trait, in: scopeOfUse)
+    case let m as TupleType:
+      return m.elements.allSatisfy({ conforms($0.type, to: trait, in: scopeOfUse) })
+    case let m as TypeAliasType:
+      return structurallyConforms(m.aliasee.value, to: trait, in: scopeOfUse)
+    case let m as UnionType:
+      return m.elements.allSatisfy({ conforms($0, to: trait, in: scopeOfUse) })
+    default:
+      return false
+    }
+  }
+
+  /// Returns `true` if a conformance of `model` to `trait` is synthesizable in `scopeOfUse`.
+  ///
+  /// A conformance *M: T* is synthesizable iff *M* structurally conforms to *T*.
+  private mutating func canSynthesizeConformance(
+    _ model: AnyType, to trait: TraitType, in scopeOfUse: AnyScopeID
+  ) -> Bool {
+    switch model.base {
+    case let m as BoundGenericType:
+      return canSynthesizeConformance(m, to: trait, in: scopeOfUse)
+    case let m as ProductType:
+      return canSynthesizeConformance(m, to: trait, in: scopeOfUse)
+    default:
+      return structurallyConforms(model, to: trait, in: scopeOfUse)
+    }
+  }
+
+  /// Returns `true` if `model` structurally conforms to `trait` in `scopeOfUse`.
+  private mutating func canSynthesizeConformance(
+    _ model: BoundGenericType, to trait: TraitType, in scopeOfUse: AnyScopeID
+  ) -> Bool {
+    let base = canonical(model.base, in: scopeOfUse)
+    let z = GenericArguments(model)
+
+    // If the base is a product type, we specialize each stored part individually to check whether
+    // the conformance holds for a specialized whole. Othwrwise, we specialize the base directly.
+    if let b = ProductType(base) {
+      let s = AnyScopeID(b.decl)
+      return program.storedParts(of: b.decl).allSatisfy { (p) in
+        let t = specialize(uncheckedType(of: p), for: z, in: s)
+        return conforms(t, to: trait, in: s)
+      }
+    } else {
+      let t = specialize(base, for: z, in: scopeOfUse)
+      return canSynthesizeConformance(t, to: trait, in: scopeOfUse)
+    }
+  }
+
+  /// Returns `true` if `model` structurally conforms to `trait` in `scopeOfUse`.
+  private mutating func canSynthesizeConformance(
+    _ model: ProductType, to trait: TraitType, in scopeOfUse: AnyScopeID
+  ) -> Bool {
+    program.storedParts(of: model.decl).allSatisfy { (p) in
+      conforms(uncheckedType(of: p), to: trait, in: scopeOfUse)
+    }
   }
 
   /// Returns the checked conformance of `model` to `trait` that is exposed to `scopeOfUse`, or
@@ -318,7 +460,7 @@ struct TypeChecker {
     // we have to check all conformance sources in scope before we can be sure we'll grab the right
     // one when we call `cachedConformance`.
     let m = canonical(model, in: scopeOfUse)
-    let r = refinements(of: trait)
+    let r = bases(of: trait)
     let s = originsOfConformance(of: m, to: trait, exposedTo: scopeOfUse)
     for o in s {
       checkConformances(to: r, declaredBy: o.source)
@@ -369,7 +511,7 @@ struct TypeChecker {
     }
 
     return .init(
-      model: model.base, concept: trait, arguments: model.arguments, conditions: [],
+      model: model.base, concept: trait, arguments: GenericArguments(model), conditions: [],
       scope: c.scope, implementations: c.implementations, isStructural: c.isStructural,
       origin: c.origin)
   }
@@ -395,34 +537,29 @@ struct TypeChecker {
   }
 
   /// Returns the origins of the conformances of `model` to `trait` exposed to `scopeOfUse`.
-  ///
-  /// - Requires: `model` is canonical.
   private mutating func originsOfConformance(
     of model: AnyType, to trait: TraitType, exposedTo scopeOfUse: AnyScopeID
   ) -> [ConformanceOrigin] {
-    assert(model[.isCanonical])
-
-    var result: [ConformanceOrigin]
-
     switch model.base {
     case let t as BoundGenericType:
       return originsOfConformance(of: t.base, to: trait, exposedTo: scopeOfUse)
     case let t as ProductType:
-      let d = ProductTypeDecl.ID(t.decl)!
-      result = originsOfConformance(to: trait, declaredBy: d, exposedTo: scopeOfUse)
+      return originsOfConformance(of: t, to: trait, exposedTo: scopeOfUse)
     case let t as TypeAliasType:
       return originsOfConformance(of: t.resolved, to: trait, exposedTo: scopeOfUse)
     default:
-      result = []
+      return originsOfConformance(to: trait, declaredInExtensionsOf: model, exposedTo: scopeOfUse)
     }
+  }
 
-    for e in extensions(of: model, exposedTo: scopeOfUse) {
-      guard let d = ConformanceDecl.ID(e) else { continue }
-      let s = originsOfConformance(to: trait, declaredBy: d, exposedTo: scopeOfUse)
-      result.append(contentsOf: s)
-    }
-
-    return result
+  /// Returns the origins of the conformances of `model` to `trait` exposed to `scopeOfUse`.
+  private mutating func originsOfConformance(
+    of model: ProductType, to trait: TraitType, exposedTo scopeOfUse: AnyScopeID
+  ) -> [ConformanceOrigin] {
+    let d = ProductTypeDecl.ID(model.decl)!
+    let r = originsOfConformance(to: trait, declaredBy: d, exposedTo: scopeOfUse)
+    let s = originsOfConformance(to: trait, declaredInExtensionsOf: ^model, exposedTo: scopeOfUse)
+    return r + s
   }
 
   /// Returns the origins of conformances to `trait` exposed to `scopeOfUse` and declared `d`.
@@ -439,18 +576,42 @@ struct TypeChecker {
     return result
   }
 
-  /// Returns the type satisfying `requirement` for `model` in `scopeOfUse`, or `nil` if `model`
-  /// does not satisfy such a requirement.
-  private mutating func demandImplementation(
-    of requirement: AssociatedTypeDecl.ID, for model: AnyType, in scopeOfUse: AnyScopeID
-  ) -> AnyType? {
-    let trait = traitDeclaring(requirement)!
-    guard
-      let c = demandConformance(of: model, to: trait, exposedTo: scopeOfUse),
-      let a = MetatypeType(uncheckedType(of: c.implementations[requirement]!.decl!))
-    else { return nil }
+  /// Returns the origins of the conformances of `model` to `trait` that are declared in extensions
+  /// exposed to `scopeOfUse`.
+  private mutating func originsOfConformance(
+    to trait: TraitType, declaredInExtensionsOf model: AnyType, exposedTo scopeOfUse: AnyScopeID
+  ) -> [ConformanceOrigin] {
+    var result: [ConformanceOrigin] = []
+    for e in extensions(of: model, exposedTo: scopeOfUse) {
+      guard let d = ConformanceDecl.ID(e) else { continue }
+      let s = originsOfConformance(to: trait, declaredBy: d, exposedTo: scopeOfUse)
+      result.append(contentsOf: s)
+    }
+    return result
+  }
 
-    return specialize(a.instance, for: c.arguments, in: c.scope)
+  /// Returns the type implementing requirement `r` for the model `m` in `scopeOfUse`, or `nil` if
+  /// `m` does not implement `r`.
+  private mutating func demandImplementation(
+    of r: AssociatedTypeDecl.ID, for m: AnyType, in scopeOfUse: AnyScopeID
+  ) -> AnyType? {
+    if let c = demandConformance(of: m, to: traitDeclaring(r)!, exposedTo: scopeOfUse) {
+      return demandImplementation(of: r, in: c)
+    } else if m.base is GenericTypeParameterType {
+      return ^AssociatedTypeType(r, domain: m, ast: program.ast)
+    } else {
+      return nil
+    }
+  }
+
+  /// Returns the type implementing requirement `r` in conformance `c` if `c` is well-formed.
+  private mutating func demandImplementation(
+    of r: AssociatedTypeDecl.ID, in c: Conformance
+  ) -> AnyType? {
+    let t = uncheckedType(of: c.implementations[r]!.decl!)
+    return MetatypeType(t).map { (a) in
+      specialize(a.instance, for: c.arguments, in: c.scope)
+    }
   }
 
   // MARK: Type transformations
@@ -475,7 +636,7 @@ struct TypeChecker {
       case let u as ProductType:
         return .stepOver(transform(mutating: &me, u, declaredBy: u.decl))
       case let u as TypeAliasType:
-        return .stepOver(transform(mutating: &me, u, declaredBy: u.decl))
+        return .stepOver(transform(mutating: &me, u))
       default:
         return .stepInto(t)
       }
@@ -483,6 +644,16 @@ struct TypeChecker {
 
     func transform(mutating me: inout Self, _ t: AssociatedTypeType) -> AnyType {
       let d = t.domain.transform(mutating: &me, transform)
+
+      // There's nothing to do if `d` is a trait receiver or another associated type. The latter
+      // case happens if we have `T.X.Y` where `T` is a trait receiver.
+      if me.isAbstractAssociatedDomain(d) {
+        return ^AssociatedTypeType(t.decl, domain: d, ast: me.program.ast)
+      }
+
+      // DR: Maybe we could use `d`'s conformance if it has already been established.
+
+      // Otherwise, look for the member of the domain that implements the associated type.
       var candidates = me.lookup(me.program[t.decl].baseName, memberOf: d, exposedTo: scopeOfUse)
 
       // Ignore associated type declaration unless they define a default value that isn't
@@ -495,18 +666,35 @@ struct TypeChecker {
         }
       }
 
-      if let selected = candidates.uniqueElement {
-        return MetatypeType(me.uncheckedType(of: selected))?.instance ?? .error
-      } else {
-        return .error
+      if let s = candidates.uniqueElement, let u = MetatypeType(me.uncheckedType(of: s)) {
+        if let b = BoundGenericType(me.canonical(d, in: scopeOfUse)) {
+          return me.specialize(u.instance, for: .init(b), in: scopeOfUse)
+        } else {
+          return u.instance
+        }
       }
+
+      return .error
     }
 
     func transform(mutating me: inout Self, _ t: BoundGenericType) -> AnyType {
-      ^t.transformArguments(mutating: &me) { (me, v) in
-        let w = v.asType ?? UNIMPLEMENTED()
-        return .type(w.transform(mutating: &me, transform))
+      let b: AnyType
+
+      switch t.base.base {
+      case is ProductType:
+        b = t.base
+      case let u as TypeAliasType:
+        let aliasee = u.aliasee.value.transform(mutating: &me, transform)
+        b = ^TypeAliasType(aliasing: aliasee, declaredBy: u.decl, in: me.program.ast)
+      default:
+        b = t.base.transform(mutating: &me, transform)
       }
+
+      let a = t.arguments.mapValues { (v) in
+        let w = v.asType ?? UNIMPLEMENTED("generic value arguments")
+        return CompileTimeValue.type(w.transform(mutating: &me, transform))
+      }
+      return ^BoundGenericType(b, arguments: a)
     }
 
     func transform(mutating me: inout Self, _ t: GenericTypeParameterType) -> AnyType {
@@ -517,9 +705,15 @@ struct TypeChecker {
       }
     }
 
-    /// If `t` is an unspecialized generic type, returns its specialization taking the arguments in
-    /// `substitutions` corresponding to the parameters introduced by `d`; returns `t` unchanged
-    /// otherwise.
+    func transform(mutating me: inout Self, _ t: TypeAliasType) -> AnyType {
+      let u = t.aliasee.value.transform(mutating: &me, transform)
+      return transform(
+        mutating: &me,
+        TypeAliasType(aliasing: u, declaredBy: t.decl, in: me.program.ast), declaredBy: t.decl)
+    }
+
+    /// If `t` is an unspecialized generic type, returns a bound generic type applying that applies
+    /// `substitution` and maps unbound parameters to fresh variables. Otherwise, returns `t`.
     ///
     /// - Requires: `t` is not a trait.
     func transform<T: TypeProtocol, D: GenericScope>(
@@ -531,11 +725,11 @@ struct TypeChecker {
         return ^t
       }
 
-      var arguments: GenericArguments = [:]
+      var a: BoundGenericType.Arguments = [:]
       for p in parameters {
-        arguments[p] = specialization[p] ?? .type(^me.freshVariable())
+        a[p] = specialization[p] ?? .type(^me.freshVariable())
       }
-      return ^BoundGenericType(t, arguments: arguments)
+      return ^BoundGenericType(t, arguments: a)
     }
   }
 
@@ -560,8 +754,7 @@ struct TypeChecker {
     }
   }
 
-  /// Returns the type declared by `d` bound to open variables for each generic parameter
-  /// introduced by `d`.
+  /// Returns the type declared by `d` with its generic parameters bound to fresh variables.
   ///
   /// - Requires: `d` is a a generic product type or type alias declaration.
   mutating func openForUnification(_ d: AnyDeclID) -> BoundGenericType {
@@ -575,8 +768,10 @@ struct TypeChecker {
     }
 
     let b = MetatypeType(uncheckedType(of: d))!.instance
-    let a = GenericArguments(
-      uniqueKeysWithValues: parameters.map({ (key: $0, value: .type(^freshVariable())) }))
+    var a: BoundGenericType.Arguments = [:]
+    for p in parameters {
+      a[p] = .type(^freshVariable())
+    }
     return BoundGenericType(b, arguments: a)
   }
 
@@ -598,7 +793,7 @@ struct TypeChecker {
   }
 
   /// Type checks `u` and all declarations nested in `d`.
-  mutating func check(_ u: TranslationUnit.ID) {
+  private mutating func check(_ u: TranslationUnit.ID) {
     _ = imports(exposedTo: u)
     check(program[u].decls)
   }
@@ -660,7 +855,7 @@ struct TypeChecker {
     case ExtensionDecl.self:
       _check(ExtensionDecl.ID(d)!)
     case FunctionDecl.self:
-      _check(FunctionDecl.ID(d)!)
+      _check(FunctionDecl.ID(d)!, ignoringSharedCache: ignoreSharedCache)
     case GenericParameterDecl.self:
       _check(GenericParameterDecl.ID(d)!)
     case ImportDecl.self:
@@ -714,21 +909,27 @@ struct TypeChecker {
   /// Type checks `d` and all declarations nested in `d`.
   ///
   /// - Requires: `d` is not the underlying declaration of a lambda.
-  private mutating func _check(_ d: FunctionDecl.ID) {
+  private mutating func _check(_ d: FunctionDecl.ID, ignoringSharedCache ignoreSharedCache: Bool) {
     checkEnvironment(of: d)
     checkParameters(program[d].parameters, of: d)
+
+    let funcAttr = FunctionAttributes(
+      externalName: program[d].isExternal ? program.ast.externalName(of: d) : nil,
+      foreignName: program[d].isForeignInterface ? program.ast.foreignName(of: d) : nil
+    )
+    cache.write(funcAttr, at: \.functionAttributes[d], ignoringSharedCache: ignoreSharedCache)
 
     switch program[d].body {
     case .block(let b):
       check(b)
 
     case .expr(let b):
-      let r = LambdaType(uncheckedType(of: d))!.output
+      let r = ArrowType(uncheckedType(of: d))!.output
       check(b, asBodyOfCallableProducing: r)
 
     case nil:
-      // Only requirements and FFIs can be without a body.
-      if !program.isRequirement(d) && !program[d].isForeignInterface {
+      // Only requirements, FFIs, and external functions can be without a body.
+      if requiresBody(d) {
         report(.error(declarationRequiresBodyAt: program[d].introducerSite))
       }
     }
@@ -774,7 +975,7 @@ struct TypeChecker {
       check(b)
 
     case .expr(let b):
-      let r = LambdaType(uncheckedType(of: d))!.output
+      let r = ArrowType(uncheckedType(of: d))!.output
       check(b, asBodyOfCallableProducing: r)
 
     case nil:
@@ -813,6 +1014,13 @@ struct TypeChecker {
     if let e = program[d].defaultValue {
       guard let p = uncheckedType(of: d).errorFree else { return }
       _ = checkedType(of: e, asArgumentTo: ParameterType(p)!)
+
+      var w = RecursiveReferenceRecognizer(
+        targets: program.siblings(of: d), referredDecl: cache.local.referredDecl)
+      program.ast.walk(e, notifying: &w)
+      for r in w.recursiveReferences {
+        report(.error(referenceToSibling: r, in: program.ast))
+      }
     }
   }
 
@@ -949,7 +1157,6 @@ struct TypeChecker {
   /// Type checks `e` as the body of a function returning or susbscript projecting `r`.
   private mutating func check(_ e: AnyExprID, asBodyOfCallableProducing r: AnyType) {
     var obligations = ProofObligations(scope: program[e].scope)
-
     let body = inferredType(of: e, withHint: r, updating: &obligations)
 
     // Inline functions may return `Never` regardless of their return type.
@@ -959,26 +1166,25 @@ struct TypeChecker {
     if areEquivalent(r, .never, in: program[e].scope) {
       obligations.insert(equalToNever)
     } else {
-      let c = DisjunctionConstraint(
+      let equalToOutput = EqualityConstraint(body, r, origin: o)
+      let equalToOutputOrNever = DisjunctionConstraint(
         between: [
-          .init(constraints: [SubtypingConstraint(body, r, origin: o)], penalties: 0),
+          .init(constraints: [equalToOutput], penalties: 0),
           .init(constraints: [equalToNever], penalties: 1),
         ],
         origin: o)
-      obligations.insert(c)
+      obligations.insert(equalToOutputOrNever)
     }
 
     discharge(obligations, relatedTo: e)
   }
 
-  /// Checks that the type of `e` is subtype of `supertype`.
-  private mutating func check(_ e: AnyExprID, coercibleTo supertype: AnyType) {
+  /// Checks that `e` is an instance of `t`.
+  private mutating func check(_ e: AnyExprID, instanceOf t: AnyType) {
     var obligations = ProofObligations(scope: program[e].scope)
-
-    let t = inferredType(of: e, withHint: supertype, updating: &obligations)
+    let u = inferredType(of: e, withHint: t, updating: &obligations)
     obligations.insert(
-      SubtypingConstraint(t, supertype, origin: .init(.structural, at: program[e].site)))
-
+      EqualityConstraint(t, u, origin: .init(.structural, at: program[e].site)))
     discharge(obligations, relatedTo: e)
   }
 
@@ -1033,17 +1239,17 @@ struct TypeChecker {
     obligations.insert(
       ConformanceConstraint(lhs, conformsTo: program.ast.core.movable.type, origin: o))
 
-    // `rhs` must be subtype of `lhs`.
+    // `rhs` must be equal of `lhs`.
     let rhs = inferredType(
       of: program[s].right, withHint: lhs, updating: &obligations)
-    obligations.insert(SubtypingConstraint(rhs, lhs, origin: o))
+    obligations.insert(EqualityConstraint(rhs, lhs, origin: o))
 
     discharge(obligations, relatedTo: s)
   }
 
   /// Type checks `s`.
   private mutating func check(_ s: ConditionalCompilationStmt.ID) {
-    for t in program.ast[s].expansion(for: program.ast.compiler) { check(t) }
+    for t in program.ast[s].expansion(for: program.ast.compilationConditions) { check(t) }
   }
 
   /// Type checks `s`.
@@ -1088,7 +1294,7 @@ struct TypeChecker {
   /// Type checks `s`.
   private mutating func check(_ s: DoWhileStmt.ID) {
     check(program[s].body)
-    check(program[s].condition.value, coercibleTo: ^program.ast.coreType("Bool")!)
+    check(program[s].condition.value, instanceOf: ^program.ast.coreType("Bool")!)
   }
 
   /// Type checks `s`.
@@ -1098,7 +1304,7 @@ struct TypeChecker {
     let e = checkedType(of: program[s].binding, usedAs: .filter(matching: element))
     checkedType(of: program[s].binding, usedAs: .filter(matching: e), ignoringSharedCache: true)
     if let e = program[s].filter {
-      check(e.value, coercibleTo: ^program.ast.coreType("Bool")!)
+      check(e.value, instanceOf: ^program.ast.coreType("Bool")!)
     }
     check(program[s].body)
   }
@@ -1108,7 +1314,7 @@ struct TypeChecker {
     let output = uncheckedOutputType(in: program[s].scope)!
 
     if let v = program[s].value {
-      check(v, coercibleTo: output)
+      check(v, instanceOf: output)
     } else if !areEquivalent(output, .void, in: program[s].scope) {
       report(.error(missingReturnValueAt: program[s].site))
     }
@@ -1123,7 +1329,7 @@ struct TypeChecker {
   /// Type checks `s`.
   private mutating func check(_ s: YieldStmt.ID) {
     let output = uncheckedOutputType(in: program[s].scope)!
-    check(program[s].value, coercibleTo: output)
+    check(program[s].value, instanceOf: output)
   }
 
   /// Type checks `condition`.
@@ -1132,7 +1338,7 @@ struct TypeChecker {
     for item in condition {
       switch item {
       case .expr(let e):
-        check(e, coercibleTo: bool)
+        check(e, instanceOf: bool)
       case .decl(let d):
         checkedType(of: d, usedAs: .condition, ignoringSharedCache: true)
       }
@@ -1177,22 +1383,21 @@ struct TypeChecker {
   /// Builds and type checks the generic environment of `d`.
   private mutating func checkEnvironment<T: GenericDecl & LexicalScope>(of d: T.ID) {
     // TODO: Type check default values
-    let e = environment(of: d)
-    check(e.parameters)
+    _ = environment(of: d)
+    check(program[d].genericParameters)
   }
 
   /// Builds and type checks the generic environment of `d`.
   private mutating func checkEnvironment(of d: TraitDecl.ID) {
     // TODO: Type check default values
-    let e = environment(of: d)
-    check(e.parameters)
+    _ = environment(of: d)
+    check(program[d].genericParameters)
   }
 
   /// Builds and type checks the generic environment of `d`.
   private mutating func checkEnvironment<T: TypeExtendingDecl>(of d: T.ID) {
     // TODO: Type check default values
-    let e = environment(of: d)
-    check(e.parameters)
+    _ = environment(of: d)
   }
 
   /// Type checks the conformances declared by `d`.
@@ -1201,7 +1406,7 @@ struct TypeChecker {
   /// each ill-typed conformance.
   private mutating func checkAllConformances<T: ConformanceSource>(declaredBy d: T.ID) {
     for (_, rhs) in evalTraitComposition(program[d].conformances) {
-      let r = refinements(of: rhs)
+      let r = bases(of: rhs)
       checkConformances(to: r, declaredBy: AnyDeclID(d))
     }
   }
@@ -1209,11 +1414,11 @@ struct TypeChecker {
   /// Type checks the conformances to `traits` declared by `d`.
   ///
   /// - Parameters:
-  ///   - traits: A refinement cluster for one of the traits mentioned by `d`. For instance, if `d`
-  ///     is a type declaration `type A: P, Q {}`, `traits` is a cluster describing the refinements
+  ///   - traits: A refinement closure for one of the traits mentioned by `d`. For instance, if `d`
+  ///     is a type declaration `type A: P, Q {}`, `traits` is a closure describing the refinements
   ///     of either `P` or `Q`.
   ///   - d: A conformance source.
-  private mutating func checkConformances(to traits: RefinementCluster, declaredBy d: AnyDeclID) {
+  private mutating func checkConformances(to traits: RefinementClosure, declaredBy d: AnyDeclID) {
     precondition(d.isConformanceSource)
 
     let scopeOfDefinition = program[d].scope
@@ -1232,12 +1437,12 @@ struct TypeChecker {
   /// conformance to a specific trait in a scope, reporting diagnostics of ambiguous cases.
   ///
   /// - Parameters:
-  ///   - trait: A trait belonging to the refinement cluster of a trait mentioned by one of the
+  ///   - trait: A trait belonging to the refinement closure of a trait mentioned by one of the
   ///     conformance sources in `origins`.
   ///   - origins: The declarations introducing a conformance to `trait` in `scopeOfDefinition`.
   ///   - scopeOfDefinition: The outermost scope in which the conformance is checked.
   ///
-  /// - Requires: Conformances to the strict refinements of `trait` have already been checked.
+  /// - Requires: Conformances to traits strictly refined by `trait` have already been checked.
   private mutating func checkConformance(
     to trait: TraitType, declaredBy origins: [ConformanceOrigin],
     in scopeOfDefinition: AnyScopeID
@@ -1247,9 +1452,9 @@ struct TypeChecker {
     // TODO: If there exists several conformances, make sure they have the same bounds.
 
     // We could use a more clever algorithm to select the least refined declaration (e.g., `A: Q`
-    // there are both `A: P` and `A: Q` such that `P` refines `Q`), but all choices have the same
-    // semantics. So any criterion is fine as long as we can generate consistent diagnostics when
-    // errors occur.
+    // where there are both `A: P` and `A: Q` such that `P` refines `Q`), but all choices have the
+    // same semantics. So any criterion is fine as long as we can generate consistent diagnostics
+    // when errors occur.
     let o = s.sorted(by: \.source.rawValue).first!
     checkConformance(to: trait, declaredBy: o)
   }
@@ -1257,10 +1462,10 @@ struct TypeChecker {
   /// Type checks the conformance to `trait` declared by `origin`.
   ///
   /// - Parameters:
-  ///   - trait: A trait belonging to the refinement cluster of a trait mentioned `origin`.
+  ///   - trait: A trait belonging to the refinement closure of a trait mentioned `origin`.
   ///   - origin: A declaration introducing a conformance to `trait`.
   ///
-  /// - Requires: Conformances to the strict refinements of `trait` have already been checked.
+  /// - Requires: Conformances to traits strictly refined by `trait` have already been checked.
   private mutating func checkConformance(
     to trait: TraitType, declaredBy origin: ConformanceOrigin
   ) {
@@ -1295,13 +1500,12 @@ struct TypeChecker {
     /// A map from requirement to its implementation.
     var implementations = Conformance.ImplementationMap()
 
-    /// The diagnostics of the errors found during conformance checking.
-    var conformanceDiagnostics = DiagnosticSet()
+    /// The detailed diagnostics describing why the checked conformance does not hold.
+    var nonConformanceNotes = DiagnosticSet()
 
-    /// A map associating the "Self" parameter of each trait in the refinement cluster of `trait`
-    /// to the type.
+    /// A map associating the "Self" parameter of each trait to which `model` conforms to `model`.
     var traitReceiverToModel = GenericArguments()
-    for t in refinements(of: trait).unordered {
+    for t in conformedTraits(of: model, in: scopeOfDefinition) {
       traitReceiverToModel[program[t.decl].receiver] = .type(model)
     }
 
@@ -1309,29 +1513,29 @@ struct TypeChecker {
       resolveImplementation(of: r)
     }
 
-    if !conformanceDiagnostics.isEmpty || !checkRequirementConstraints() {
+    if !nonConformanceNotes.isEmpty || !checkRequirementConstraints() {
       // Use `extendedModel(_:)` to get `model` as it was declared in program sources.
       let m = extendedModel(origin.source)
-      report(.error(m, doesNotConformTo: trait, at: origin.site, because: conformanceDiagnostics))
+      report(.error(m, doesNotConformTo: trait, at: origin.site, because: nonConformanceNotes))
       return
     }
 
     let c = Conformance(
       model: BoundGenericType(model)?.base ?? model, concept: trait,
-      arguments: [:], conditions: [], scope: scopeOfExposition,
+      arguments: .empty, conditions: [], scope: scopeOfExposition,
       implementations: implementations, isStructural: false, origin: origin)
     insertConformance(c)
     return
 
     /// The information describing how to refer to and use an entity.
-    typealias API = (type: AnyType, name: Name, environment: GenericEnvironment?)
+    typealias API = (type: AnyType, name: Name, parameters: [GenericParameterDecl.ID])
 
     /// Returns the API of `m` viewed as a member of `model` through its conformance to `trait`.
     func canonicaAPI(of m: AnyDeclID) -> API {
-      let t = canonical(expectedType(of: m), in: scopeOfDefinition)
-      let n = program.name(of: m)!
-      let e = memberEnvironment(of: m)
-      return (type: t, name: n, environment: e)
+      return (
+        type: canonical(expectedType(of: m), in: scopeOfDefinition),
+        name: program.name(of: m)!,
+        parameters: genericParameters(introducedBy: m))
     }
 
     /// Returns the type of `m` viewed as a member of `model` through its conformance to `trait`.
@@ -1376,10 +1580,10 @@ struct TypeChecker {
       guard let d = implementation(of: requirement) else {
         let n = Diagnostic.note(
           trait: trait, requiresAssociatedType: program[requirement].baseName, at: origin.site)
-        conformanceDiagnostics.insert(n)
+        nonConformanceNotes.insert(n)
         return
       }
-      implementations[requirement] = .concrete(d)
+      implementations[requirement] = .explicit(d)
     }
 
     /// Identifies the implementation of `requirement` for `model`.
@@ -1388,18 +1592,25 @@ struct TypeChecker {
     func resolveFunctionalImplementation(of requirement: AnyDeclID) {
       let expectedAPI = canonicaAPI(of: requirement)
 
+      // Look for a user-defined implementation.
       if let d = concreteImplementation(of: requirement, withAPI: expectedAPI) {
-        implementations[requirement] = .concrete(d)
-      } else if let d = syntheticImplementation(of: requirement, withAPI: expectedAPI) {
+        implementations[requirement] = .explicit(d)
+      }
+
+      // Build a synthetic implementation if possible.
+      else if let d = syntheticImplementation(of: requirement, withAPI: expectedAPI) {
         implementations[requirement] = .synthetic(d)
         registerSynthesizedDecl(d, in: program.module(containing: program[origin.source].scope))
-      } else {
+      }
+
+      // No implementation matches the requirement.
+      else {
         let t = expectedType(of: requirement)
         let n = Diagnostic.note(
           trait: trait, requires: requirement.kind,
           named: expectedAPI.name, typed: t,
           at: origin.site)
-        conformanceDiagnostics.insert(n)
+        nonConformanceNotes.insert(n)
       }
     }
 
@@ -1408,12 +1619,16 @@ struct TypeChecker {
     func syntheticImplementation(
       of requirement: AnyDeclID, withAPI expectedAPI: API
     ) -> SynthesizedFunctionDecl? {
-      guard let k = program.ast.synthesizedKind(of: requirement, definedBy: trait) else {
-        return nil
-      }
+      guard
+        let k = program.ast.synthesizedKind(of: requirement),
+        canSynthesizeConformance(model, to: trait, in: scopeOfDefinition)
+      else { return nil }
+
+      let t = ArrowType(expectedAPI.type)!
+      let h = Array(t.environment.skolems)
 
       // Note: compiler-known requirement is assumed to be well-typed.
-      return .init(k, typed: LambdaType(expectedAPI.type)!, in: AnyScopeID(origin.source)!)
+      return .init(k, typed: t, parameterizedBy: h, in: AnyScopeID(origin.source)!)
     }
 
     /// Returns a concrete implementation of `requirement` for `model` with given `expectedAPI`,
@@ -1421,7 +1636,7 @@ struct TypeChecker {
     func concreteImplementation(
       of requirement: AnyDeclID, withAPI expectedAPI: API
     ) -> AnyDeclID? {
-      guard !expectedAPI.type[.hasError] else { return nil }
+      if expectedAPI.type[.hasError] { return nil }
 
       switch requirement.kind {
       case FunctionDecl.self:
@@ -1461,8 +1676,7 @@ struct TypeChecker {
         s.append(c)
       }
 
-      // Conformance is ambiguous if there are multiple viable candidates.
-      return viable.uniqueElement
+      return uniqueViableCandidate(in: viable)
     }
 
     /// Returns the implementation of `requirement` in `model` or `nil` if there's none.
@@ -1486,7 +1700,17 @@ struct TypeChecker {
       }
 
       viable = viable.minimalElements(by: { (a, b) in compareDepth(a, b, in: scopeOfDefinition) })
-      return viable.uniqueElement
+      return uniqueViableCandidate(in: viable)
+    }
+
+    /// Returns the contents of `candidates` if it contains a single declaration, reporting a
+    /// diagnostic if it doesn't have the right visibility. Otherwise, returns `nil`.
+    func uniqueViableCandidate(in candidates: [AnyDeclID]) -> AnyDeclID? {
+      guard let pick = candidates.uniqueElement else { return nil }
+      if !program.isAccessibleAsRequirementImplementation(pick) {
+        nonConformanceNotes.insert(.note(implementationMustBePublic: pick, in: program.ast))
+      }
+      return pick
     }
 
     /// Appends the function definitions of `d` that have API `a` to `s` .
@@ -1518,18 +1742,21 @@ struct TypeChecker {
       // A generic requirement must be implemented by a generic implementation whose environment
       // implies that of the requirement.
       let expectedType: AnyType
-      if let lhs = a.environment?.parameters, !lhs.isEmpty {
-        guard let rhs = b.environment?.parameters, lhs.count == rhs.count else { return }
+
+      if a.parameters.isEmpty {
+        expectedType = a.type
+      } else if a.parameters.count == b.parameters.count {
         var s = GenericArguments()
-        for (p, t) in zip(lhs, rhs) {
+        for (p, t) in zip(a.parameters, b.parameters) {
           s[p] = .type(^GenericTypeParameterType(t, ast: program.ast))
         }
         expectedType = specialize(a.type, for: s, in: scopeOfDefinition)
       } else {
-        expectedType = a.type
+        return
       }
 
       assert(expectedType[.isCanonical] && b.type[.isCanonical])
+      // TODO: Use semantic equality
       if program[d].isDefinition && (b.type == expectedType) {
         s.append(AnyDeclID(d))
       }
@@ -1633,6 +1860,37 @@ struct TypeChecker {
     return (t, obligations)
   }
 
+  /// Calls `action` with the innermost generic scopes containing `s`.
+  ///
+  /// A scope `s` inherits from a generic environment `g` if:
+  /// - `s` is notionally contained in `g`; and/or
+  /// - `s` declares a trait `t` and `g` is the environment of a trait refined by `t`; and/or
+  /// - `s` is an extension and `g` is the environment of the type extended by `s`.
+  private mutating func forEachGenericParentScope(
+    inheritedBy s: AnyScopeID,
+    do action: (inout Self, AnyScopeID) -> Void
+  ) {
+    switch s.kind {
+    case ModuleDecl.self:
+      return
+    case ConformanceDecl.self:
+      if let e = scopeExtended(by: ConformanceDecl.ID(s)!) { action(&self, e) }
+    case ExtensionDecl.self:
+      if let e = scopeExtended(by: ExtensionDecl.ID(s)!) { action(&self, e) }
+    case TraitDecl.self:
+      let t = TraitType(TraitDecl.ID(s)!, ast: program.ast)
+      for u in bases(of: t).unordered where u != t {
+        action(&self, AnyScopeID(u.decl))
+      }
+    default:
+      break
+    }
+
+    if let s = program.scopes(from: program[s].scope).first(where: \.isGenericScope) {
+      action(&self, s)
+    }
+  }
+
   /// Returns the generic environment introduced by `s`, if any.
   private mutating func environment(of s: AnyScopeID) -> GenericEnvironment? {
     switch s.kind {
@@ -1663,72 +1921,76 @@ struct TypeChecker {
   private mutating func environment<T: GenericDecl & LexicalScope>(
     of d: T.ID
   ) -> GenericEnvironment {
-    // Check if work has to be done.
     if let e = cache.read(\.environment[d]) { return e }
 
-    // Nothing to do if the declaration has no generic clause.
     guard let clause = program[d].genericClause?.value else {
-      return commit(GenericEnvironment(introducing: []))
+      let e = initialEnvironment(of: d, introducing: [])
+      return commit(e)
     }
 
-    var result = GenericEnvironment(introducing: clause.parameters)
+    var partialResult = initialEnvironment(of: d, introducing: clause.parameters)
+
     for p in clause.parameters {
-      insertAnnotatedConstraints(on: p, in: &result)
-    }
-    for c in (clause.whereClause?.value.constraints ?? []) {
-      insertConstraint(c, in: &result)
-    }
-    return commit(result)
+      let lhs = uncheckedType(of: p)
 
-    /// Commits `e` as the environment of `d` to the cache.
-    func commit(_ e: GenericEnvironment) -> GenericEnvironment {
-      cache.write(e, at: \.environment[d])
-      return e
+      // Nothing more to do if the parameter isn't type-kinded or doesn't have trait bounds.
+      let bounds = program[p].conformances
+      guard !bounds.isEmpty, let t = MetatypeType(lhs) else { continue }
+
+      for (n, u) in evalTraitComposition(bounds) {
+        let c = GenericConstraint(.conformance(t.instance, u), at: program[n].site)
+        insertConstraint(c, in: &partialResult)
+      }
     }
+
+    if let w = clause.whereClause {
+      for c in w.value.constraints {
+        insertConstraint(c, in: &partialResult)
+      }
+    }
+
+    return commit(partialResult)
   }
 
   /// Returns the generic environment introduced by `d`.
   private mutating func environment(of d: TraitDecl.ID) -> GenericEnvironment {
-    // Check if work has to be done.
     if let e = cache.read(\.environment[d]) { return e }
 
-    let receiver = program[d].receiver.id
-    var result = GenericEnvironment(introducing: [receiver])
+    let r = program[d].receiver.id
+    var partialResult = initialEnvironment(of: d, introducing: [r])
+
+    // Synthesize `Self: T`.
+    let s = GenericTypeParameterType(selfParameterOf: d, in: program.ast)
+    cache.write(^MetatypeType(of: s), at: \.declType[r], ignoringSharedCache: true)
+
+    let t = TraitType(uncheckedType(of: d))!
+    let c = GenericConstraint(.conformance(^s, t), at: program[d].identifier.site)
+    insertConstraint(c, in: &partialResult)
 
     for m in program[d].members {
       switch m.kind {
       case AssociatedTypeDecl.self:
-        insertConstraints(of: AssociatedTypeDecl.ID(m)!, in: &result)
+        insertConstraints(of: AssociatedTypeDecl.ID(m)!, in: &partialResult)
       case AssociatedValueDecl.self:
-        insertConstraints(of: AssociatedValueDecl.ID(m)!, in: &result)
+        insertConstraints(of: AssociatedValueDecl.ID(m)!, in: &partialResult)
       default:
         continue
       }
     }
 
-    // Synthesize `Self: T`.
-    let s = GenericTypeParameterType(receiver, ast: program.ast)
-    let t = TraitType(uncheckedType(of: d))!
-    for c in refinements(of: t).unordered {
-      result.insertConstraint(.init(.conformance(^s, c), at: program[d].identifier.site))
-    }
-
-    cache.write(result, at: \.environment[d])
-    return result
+    return commit(partialResult)
   }
 
-  /// Returns the generic environment introduced by `s`.
+  /// Returns the generic environment introduced by `d`.
   private mutating func environment<T: TypeExtendingDecl>(of d: T.ID) -> GenericEnvironment {
-    // Check if work has to be done.
     if let e = cache.read(\.environment[d]) { return e }
 
-    var result = GenericEnvironment(introducing: [])
+    var partialResult = initialEnvironment(of: d, introducing: [])
     for c in (program[d].whereClause?.value.constraints ?? []) {
-      insertConstraint(c, in: &result)
+      insertConstraint(c, in: &partialResult)
     }
 
-    cache.write(result, at: \.environment[d])
-    return result
+    return commit(partialResult)
   }
 
   /// Returns the generic environment introduced by the declaration of `t`, if any.
@@ -1743,6 +2005,44 @@ struct TypeChecker {
     default:
       return nil
     }
+  }
+
+  /// Creates the partially formed generic environment of `d`, which introduces `parameters`,
+  /// initialized with constraints inherited from the enclosing generic environment.
+  private mutating func initialEnvironment<T: Decl>(
+    of d: T.ID, introducing parameters: [GenericParameterDecl.ID]
+  ) -> GenericEnvironment {
+    if let e = cache.partiallyFormedEnvironment[d] {
+      return e
+    }
+
+    var e = GenericEnvironment(of: AnyDeclID(d), introducing: parameters)
+    forEachGenericParentScope(inheritedBy: AnyScopeID(d)!) { (me, p) in
+      e.extend(me.environment(of: p)!, in: me.program.ast)
+    }
+
+    cache.partiallyFormedEnvironment[d] = e
+    return e
+  }
+
+  /// Returns the generic environment introduced by `d`, which may be partially formed.
+  private mutating func possiblyPartiallyFormedEnvironment(
+    of d: AnyDeclID
+  ) -> GenericEnvironment? {
+    if let e = cache.partiallyFormedEnvironment[d] {
+      return e
+    } else if let s = AnyScopeID(d) {
+      return environment(of: s)
+    } else {
+      return nil
+    }
+  }
+
+  /// Ensures `e` is consistent and writes it to the cache.
+  private mutating func commit(_ finalResult: GenericEnvironment) -> GenericEnvironment {
+    cache.partiallyFormedEnvironment[finalResult.decl] = nil
+    cache.write(finalResult, at: \.environment[finalResult.decl])
+    return finalResult
   }
 
   /// Returns the generic environment introduced by `m` or its immediate parent if `m` is a variant
@@ -1793,13 +2093,12 @@ struct TypeChecker {
 
     // Synthesize sugared conformance constraint, if any.
     for (n, t) in evalTraitComposition(program[p].conformances) {
-      for c in refinements(of: t).unordered {
-        e.insertConstraint(.init(.conformance(lhs, c), at: program[n].site))
-      }
+      let c = GenericConstraint(.conformance(lhs, t), at: program[n].site)
+      insertConstraint(c, in: &e)
     }
   }
 
-  /// Inserts `c` in `e`.
+  /// Evaluates `c` as a generic constraint and inserts it in `e`.
   private mutating func insertConstraint(
     _ c: SourceRepresentable<WhereClause.ConstraintExpr>, in e: inout GenericEnvironment
   ) {
@@ -1811,26 +2110,109 @@ struct TypeChecker {
       else { return }
 
       if lhs.isTypeParameter || rhs.isTypeParameter {
-        e.insertConstraint(.init(.equality(lhs, rhs), at: c.site))
+        insertConstraint(.init(.equality(lhs, rhs), at: c.site), in: &e)
       } else {
         report(.error(invalidEqualityConstraintBetween: lhs, and: rhs, at: c.site))
       }
 
-    case .conformance(let l, let r):
+    case .bound(let l, let r):
       guard let lhs = evalTypeAnnotation(AnyExprID(l)).errorFree else { return }
       guard lhs.isTypeParameter else {
         report(.error(invalidConformanceConstraintTo: lhs, at: c.site))
         return
       }
 
-      for (_, rhs) in evalTraitComposition(r) {
-        e.insertConstraint(.init(.conformance(lhs, rhs), at: c.site))
+      let r2 = r.map({ (e) in NameExpr.ID.init(e)! })
+      for (_, rhs) in evalTraitComposition(r2) {
+        insertConstraint(.init(.conformance(lhs, rhs), at: c.site), in: &e)
       }
 
     case .value(let p):
       // TODO: Symbolic execution
-      return e.insertConstraint(.init(.predicate(p), at: c.site))
+      insertConstraint(.init(.predicate(p), at: c.site), in: &e)
     }
+  }
+
+  /// Inserts `c` in `e` and registers the conformances and equalities that `c` implies.
+  private mutating func insertConstraint(
+    _ c: GenericConstraint, in e: inout GenericEnvironment
+  ) {
+    switch c.value {
+    case .conformance(let lhs, let rhs):
+      for c in bases(of: rhs).unordered {
+        e.establishConformance(lhs, to: c)
+      }
+
+    case .equality(let lhs, let rhs):
+      e.establishEquivalence(lhs, rhs)
+
+    case .instance:
+      break
+
+    case .predicate:
+      UNIMPLEMENTED("generic value constraints")
+    }
+
+    e.insertConstraint(c)
+    cache.partiallyFormedEnvironment[e.decl] = e
+  }
+
+  /// Returns `(trait, hasError)` where `trait` is the trait to which `bound` resolves or `nil` if
+  /// it resolves to another entity, and `hasError` is `true` iff name resolution failed.
+  ///
+  /// This method does not run standard name resolution on `bound`, as it may require information
+  /// in which `bound` occurs. Instead, it processes the components of `bound` one by one, bailing
+  /// out as soon as it find one that denotes a type or expression since trait declarations can
+  /// only occur at global scope.
+  ///
+  /// - Parameters:
+  ///   - bound: The expression of a bound on a generic parameter declaration or the RHS of a
+  ///     conformance constraint in a where clause.
+  ///   - scopeOfUse: The declaration defining the environment in which `bound` occurs.
+  private mutating func resolveTrait(
+    expressedBy bound: NameExpr.ID,
+    inEnvironmentOf scopeOfUse: AnyScopeID
+  ) -> (trait: TraitType?, hasError: Bool) {
+    let (n, d) = program.ast.splitNominalComponents(of: bound)
+
+    // `bound` can't denote a trait if it contains a non-nominal component.
+    if d != .none {
+      return (nil, false)
+    }
+
+    // `bound` can't denote a trait if it refers to a generic parameter.
+    if let ns = names(introducedIn: scopeOfUse)[program[n.last!].name.value.stem] {
+      if ns.contains(where: { $0.kind == GenericParameterDecl.self }) {
+        return (nil, false)
+      }
+    }
+
+    // We can apply name resolution on the components of `bound` as long as they don't have
+    // generic arguments. A name expression with arguments can't denote a trait.
+    var parent: NameResolutionContext? = nil
+    for c in n.reversed() {
+      if !program[c].arguments.isEmpty {
+        return (nil, false)
+      }
+
+      let candidates = resolve(c, in: parent, usedAs: .unapplied)
+      if candidates.isEmpty {
+        return (nil, true)
+      }
+
+      guard let pick = candidates.uniqueElement else {
+        return (nil, false)
+      }
+
+      switch pick.type.base {
+      case is ModuleType, is NamespaceType, is TraitType:
+        parent = .init(type: pick.type, arguments: .empty, receiver: .explicit(AnyExprID(c)))
+      default:
+        return (nil, false)
+      }
+    }
+
+    return (TraitType(parent?.type), false)
   }
 
   /// Returns the type of `d`, computing it if necessary, without type checking `d`.
@@ -1846,8 +2228,12 @@ struct TypeChecker {
   ) -> AnyType {
     // Check for infinite recursion.
     if let t = cache.uncheckedType[d] {
-      guard let u = t.computed else { fatalError("infinite recursion") }
-      return u
+      if let u = t.computed {
+        return u
+      } else {
+        report(.error(recursiveDefinition: AnyDeclID(d), in: program.ast))
+        return .error
+      }
     } else {
       cache.uncheckedType[d] = .inProgress
     }
@@ -1970,29 +2356,43 @@ struct TypeChecker {
       cache.write(^ParameterType(k, r), at: \.declType[program[d].receiver!])
 
       let e = TupleType([.init(label: "self", type: k == .sink ? r : ^RemoteType(k, r))])
-      return ^LambdaType(receiverEffect: k, environment: ^e, inputs: inputs, output: output)
+      return ^ArrowType(receiverEffect: k, environment: ^e, inputs: inputs, output: output)
     }
 
     assert(program[d].receiver == nil)
     let captures = uncheckedCaptureTypes(of: d)
     let e = TupleType(captures.explicit + captures.implicit)
-    return ^LambdaType(environment: ^e, inputs: inputs, output: output)
+    return ^ArrowType(environment: ^e, inputs: inputs, output: output)
   }
 
   /// Computes and returns the type of `d`.
   private mutating func _uncheckedType(of d: GenericParameterDecl.ID) -> AnyType {
-    let bounds = program[d].conformances.map({ evalTypeAnnotation(AnyExprID($0)) })
-
-    // The declaration introduces a value if it's first annotation isn't a trait. Otherwise, it
-    // introduces a type.
-    if let first = bounds.first, !(first.base is TraitType) {
-      if bounds.count > 1 {
-        let s = program[program[d].conformances[1]].site
-        report(.error(tooManyAnnotationsOnGenericValueParametersAt: s))
-      }
-      return first
-    } else {
+    // If `p` is introduced without any bounds, it is assumed to be type-kinded.
+    guard let bounds = program[d].conformances.headAndTail else {
       return ^MetatypeType(of: GenericTypeParameterType(d, ast: program.ast))
+    }
+
+    // Otherwise, the first bound of `p` determines its kind.
+    let (firstBoundAsTrait, nameResolutionFailed) = resolveTrait(
+      expressedBy: bounds.head, inEnvironmentOf: program[d].scope)
+
+    // Register failures so we can fail fast.
+    if nameResolutionFailed {
+      return ^MetatypeType(of: GenericTypeParameterType(d, ast: program.ast))
+    }
+
+    // If the first bound is a trait, then `p` is type-kinded.
+    if firstBoundAsTrait != nil {
+      return ^MetatypeType(of: GenericTypeParameterType(d, ast: program.ast))
+    }
+
+    // Otherwise, `p` is value-kinded.
+    else {
+      let rhs = evalTypeAnnotation(AnyExprID(bounds.head))
+      if let n = bounds.tail.first {
+        report(.error(tooManyAnnotationsOnGenericValueParametersAt: program[n].site))
+      }
+      return rhs
     }
   }
 
@@ -2020,7 +2420,7 @@ struct TypeChecker {
 
     let i = CallableTypeParameter(label: "self", type: t)
     let inputs = uncheckedInputTypes(of: program[d].parameters, declaredBy: d)
-    return ^LambdaType(environment: .void, inputs: [i] + inputs, output: .void)
+    return ^ArrowType(environment: .void, inputs: [i] + inputs, output: .void)
   }
 
   /// Computes and returns the type of `d`.
@@ -2043,35 +2443,8 @@ struct TypeChecker {
     }
 
     let k = program[d].introducer.value
-    assert(bundle.capabilities.contains(k))
-
-    let r = bundle.receiver
-    cache.write(^ParameterType(k, r), at: \.declType[program[d].receiver])
-
-    let e: AnyType
-    let o: AnyType
-    switch k {
-    case .let:
-      e = ^TupleType([.init(label: "self", type: ^RemoteType(k, r))])
-      o = bundle.output
-
-    case .sink:
-      e = ^TupleType([.init(label: "self", type: r)])
-      o = bundle.output
-
-    case .set, .inout:
-      guard let t = mutatingVariantOutput(of: bundle, in: program[d].scope) else {
-        diagnostics.insert(.error(mutatingBundleMustReturnTupleAt: program[d].introducer.site))
-        return .error
-      }
-      e = ^TupleType([.init(label: "self", type: ^RemoteType(k, r))])
-      o = t
-
-    case .yielded:
-      unreachable()
-    }
-
-    return ^LambdaType(receiverEffect: k, environment: e, inputs: bundle.inputs, output: o)
+    cache.write(^ParameterType(k, bundle.receiver), at: \.declType[program[d].receiver])
+    return ^bundle.variant(k)
   }
 
   /// Computes and returns the type of `d`.
@@ -2211,6 +2584,11 @@ struct TypeChecker {
   private mutating func uncheckedInputTypes<T: Decl & LexicalScope>(
     of ps: [ParameterDecl.ID], declaredBy d: T.ID
   ) -> [CallableTypeParameter] {
+    // The generic environment of the declaration is built before we can resolve the types of the
+    // parameter annotations to avoid infinite recursion in cases the bounds of a generic parameter
+    // lead name resolution back to environment (e.g., `<T: P>(x: T)` in a trait extension.)
+    _ = environment(of: AnyScopeID(d))
+
     var result: [CallableTypeParameter] = []
     for p in ps {
       precondition(program[p].annotation != nil)
@@ -2225,7 +2603,7 @@ struct TypeChecker {
   }
 
   /// Computes and returns the types of the inputs of `e`'s underlying declaration, using `hint`
-  /// to guess the passing conventions of unnaotated parameters.
+  /// to guess the passing conventions of unanotated parameters.
   ///
   /// `hint` is used as contextual information to refine guesses iff it is a lambda type with the
   /// same number of parameters as `e`. Parameter annotations take precedence in case of conflict.
@@ -2234,7 +2612,7 @@ struct TypeChecker {
   /// type annotation. Type checking is expected to reify such variables once the type of the
   /// expression in which `e` occurs has been checked.
   private mutating func uncheckedInputTypes(
-    of e: LambdaExpr.ID, withHint hint: LambdaType?
+    of e: LambdaExpr.ID, withHint hint: ArrowType?
   ) -> [CallableTypeParameter] {
     let d = program[e].decl.id
     let ps = program[d].parameters
@@ -2266,7 +2644,7 @@ struct TypeChecker {
 
   /// Returns the passing conventions of `e`'s parameters inferred from uses in `e`'s body.
   ///
-  /// Parameters used immutably is inferred to be passed `let` unless corresponding hints specify
+  /// Parameters used immutably are inferred to be passed `let` unless corresponding hints specify
   /// a different convention. Parameters used mutably are inferred to be passed `inout` unless
   /// corresponding hints specify a convention other than `let`.
   ///
@@ -2283,14 +2661,13 @@ struct TypeChecker {
     }
 
     // Look at uses to update conventions where we could only guess `let` from the context.
-    for (n, m) in program.ast.uses(in: AnyDeclID(program[e].decl)) {
+    for (n, m) in program.ast.uses(in: program[e].decl) {
       let candidates = lookup(unqualified: program[n].name.value.stem, in: program[n].scope)
-      guard
-        let pick = candidates.unique(ParameterDecl.self),
-        let i = ps.firstIndex(of: pick),
-        result[i] == .let
-      else { continue }
-      result[i] = m
+      if let i = candidates.unique(ParameterDecl.self).flatMap(ps.firstIndex(of:)) {
+        if result[i] == .let {
+          result[i] = m
+        }
+      }
     }
 
     return result
@@ -2317,12 +2694,12 @@ struct TypeChecker {
 
   /// Computes and returns the type of values returned by `d`.
   private mutating func uncheckedOutputType(of d: FunctionDecl.ID) -> AnyType {
-    LambdaType(uncheckedType(of: d))?.output ?? .error
+    ArrowType(uncheckedType(of: d))?.output ?? .error
   }
 
   /// Computes and returns the type of values returned by `d`.
   private mutating func uncheckedOutputType(of d: MethodImpl.ID) -> AnyType {
-    LambdaType(uncheckedType(of: d))?.output ?? .error
+    ArrowType(uncheckedType(of: d))?.output ?? .error
   }
 
   /// Computes and returns the type of values projected by `d`.
@@ -2361,7 +2738,7 @@ struct TypeChecker {
   }
 
   /// Returns the implicit captures found in the body of `d`.
-  private mutating func implicitCaptures<T: Decl & LexicalScope>(
+  private mutating func implicitCaptures<T: CapturingDecl>(
     of d: T.ID, ignoring explicitCaptures: Set<String>
   ) -> [TupleType.Element] {
     // Only local declarations have captures.
@@ -2371,7 +2748,7 @@ struct TypeChecker {
     }
 
     var captureToStemAndEffect: [AnyDeclID: (stem: String, effect: AccessEffect)] = [:]
-    for (name, mutability) in program.ast.uses(in: AnyDeclID(d)) {
+    for (name, mutability) in program.ast.uses(in: d) {
       guard
         let (stem, pick) = lookupImplicitCapture(name, occurringIn: d),
         !explicitCaptures.contains(stem)
@@ -2384,10 +2761,12 @@ struct TypeChecker {
 
     var captures: [ImplicitCapture] = []
     var types: [TupleType.Element] = []
-    for (d, x) in captureToStemAndEffect {
-      guard let t = resolveType(of: d) else { continue }
+    for (c, x) in captureToStemAndEffect {
+      let t = resolveType(of: c, exposedTo: AnyScopeID(d), reportingDiagnosticsAt: program[d].site)
+      if t[.hasError] { continue }
+
       let u = RemoteType(x.effect, t)
-      captures.append(ImplicitCapture(name: .init(stem: x.stem), type: u, decl: d))
+      captures.append(ImplicitCapture(name: .init(stem: x.stem), type: u, decl: c))
       types.append(.init(label: x.stem, type: ^u))
     }
 
@@ -2396,7 +2775,7 @@ struct TypeChecker {
   }
 
   /// Returns type of `d`'s memberwise initializer.
-  private mutating func memberwiseInitializer(of d: ProductTypeDecl.ID) -> LambdaType {
+  private mutating func memberwiseInitializer(of d: ProductTypeDecl.ID) -> ArrowType {
     let r = resolveReceiverMetatype(in: d)!.instance
     var inputs = [CallableTypeParameter(label: "self", type: ^ParameterType(.set, r))]
 
@@ -2409,7 +2788,7 @@ struct TypeChecker {
       }
     }
 
-    return LambdaType(environment: .void, inputs: inputs, output: .void)
+    return ArrowType(environment: .void, inputs: inputs, output: .void)
   }
 
   /// Returns the model for which `d` declares conformances.
@@ -2497,14 +2876,8 @@ struct TypeChecker {
     switch t.base {
     case let u as MetatypeType:
       return u.instance
-
     case is ErrorType, is NamespaceType, is TraitType:
       return t
-
-    case let u as RemoteType where u.bareType.base is MetatypeType:
-      // FIXME: Workaround to deal with the fact that `remote let T` is ambiguous.
-      return ^RemoteType(u.access, MetatypeType(u.bareType)!.instance)
-
     default:
       return nil
     }
@@ -2537,7 +2910,7 @@ struct TypeChecker {
   }
 
   /// Evaluates and returns the qualification of `e`, which is a type annotation.
-  private mutating func evalQualification(of e: NameExpr.ID) -> AnyType? {
+  private mutating func evalTypeQualification(of e: NameExpr.ID) -> AnyType? {
     switch program[e].domain {
     case .explicit(let q):
       return evalTypeAnnotation(q)
@@ -2549,9 +2922,26 @@ struct TypeChecker {
     }
   }
 
+  /// Returns the inferred qualification of `e`, using `implicitQualification` to resolve implicit
+  /// domains and updating `obligations`.
+  public mutating func inferredQualification(
+    of e: NameExpr.ID, implicitlyIn implicitQualification: AnyType?,
+    updating obligations: inout ProofObligations
+  ) -> AnyType? {
+    switch program[e].domain {
+    case .explicit(let q):
+      let h = program.ast.isImplicitlyQualified(q) ? implicitQualification : nil
+      return inferredType(of: q, withHint: h, updating: &obligations)
+    case .implicit:
+      return implicitQualification
+    case .none, .operand:
+      unreachable()
+    }
+  }
+
   /// Evaluates and returns the parameter annotations of `e`.
   private mutating func evalParameterAnnotations(
-    of e: LambdaTypeExpr.ID
+    of e: ArrowTypeExpr.ID
   ) -> [CallableTypeParameter] {
     var result: [CallableTypeParameter] = []
     for p in program[e].parameters {
@@ -2567,8 +2957,8 @@ struct TypeChecker {
 
     if program[e].isAutoclosure {
       let s = program[program[e].bareType].site
-      guard let u = LambdaType(t), u.inputs.isEmpty else {
-        report(.error(autoclosureExpectsEmptyLambdaAt: s, given: t))
+      guard let u = ArrowType(t), u.inputs.isEmpty else {
+        report(.error(autoclosureExpectsEmptyEnvironment: s, given: t))
         return .error
       }
     }
@@ -2608,8 +2998,8 @@ struct TypeChecker {
   ///
   /// The returned sequence contains an element for each valid trait expression in `composition`.
   /// A diagnostic is reported each invalid expression.
-  private mutating func evalTraitComposition(
-    _ composition: [NameExpr.ID]
+  private mutating func evalTraitComposition<S: Sequence<NameExpr.ID>>(
+    _ composition: S
   ) -> [(name: NameExpr.ID, trait: TraitType)] {
     var result: [(name: NameExpr.ID, trait: TraitType)] = []
 
@@ -2650,7 +3040,9 @@ struct TypeChecker {
   private mutating func eval(
     existentialBound e: NameExpr.ID
   ) -> (AnyType, Set<GenericConstraint>) {
-    let resolution = resolve(e, withNonNominalPrefix: { (me, p) in me.evalQualification(of: p) })
+    let resolution = resolve(e) { (me, n) in
+      me.evalTypeQualification(of: n)
+    }
 
     switch resolution {
     case .failed:
@@ -2758,8 +3150,8 @@ struct TypeChecker {
 
   /// Returns the declarations that introduce `name` and are exposed to `scopeOfUse`.
   ///
-  /// Declarations are lookup up qualified in the declaration space of `nominalScope` if it isn't
-  /// `nil`. Otherwise, they are looked up unqualified from `scopeOfuse`.
+  /// Declarations are lookup up qualified in `nominalScope` if it isn't `nil`. Otherwise, they are
+  /// looked up unqualified from `scopeOfuse`. Access modifiers are ignored.
   private mutating func lookup(
     _ name: SourceRepresentable<Name>, memberOf nominalScope: AnyType?,
     exposedTo scopeOfuse: AnyScopeID
@@ -2903,6 +3295,8 @@ struct TypeChecker {
     switch nominalScope.base {
     case is ErrorType:
       return []
+    case let t as AssociatedTypeType:
+      return lookup(stem, memberOf: t, exposedTo: scopeOfUse)
     case let t as BoundGenericType:
       return lookup(stem, memberOf: t.base, exposedTo: scopeOfUse)
     case let t as ConformanceLensType:
@@ -2944,6 +3338,19 @@ struct TypeChecker {
       matches.formUnion(lookup(stem, inExtensionsOf: nominalScope, exposedTo: scopeOfUse))
     }
 
+    return matches
+  }
+
+  /// Returns the declarations that introduce a name with given `stem` as member of `nominalScope`
+  /// and are exposed to `scopeOfUse`.
+  private mutating func lookup(
+    _ stem: String, memberOf nominalScope: AssociatedTypeType,
+    exposedTo scopeOfUse: AnyScopeID
+  ) -> Set<AnyDeclID> {
+    var matches = Set<AnyDeclID>()
+    for t in conformedTraits(of: nominalScope, in: scopeOfUse) {
+      matches.formUnion(lookup(stem, memberOf: ^t, exposedTo: scopeOfUse))
+    }
     return matches
   }
 
@@ -2991,8 +3398,12 @@ struct TypeChecker {
   ) -> Set<AnyDeclID> {
     if let d = names(introducedIn: nominalScope.decl)[stem] {
       return d
-    } else {
+    } else if program[nominalScope.decl].genericParameters.isEmpty {
       return lookup(stem, memberOf: nominalScope.aliasee.value, exposedTo: scopeOfUse)
+    } else {
+      let t = MetatypeType(uncheckedType(of: nominalScope.decl))!
+      let a = TypeAliasType(t.instance)!.aliasee.value
+      return lookup(stem, memberOf: a, exposedTo: scopeOfUse)
     }
   }
 
@@ -3057,8 +3468,9 @@ struct TypeChecker {
     _ c: NameExpr.ID, occurringIn d: T.ID
   ) -> (stem: String, decl: AnyDeclID)? {
     let n = program[c].name
+    let s = AnyScopeID(d)
     var candidates = lookup(unqualified: n.value.stem, in: program[c].scope)
-    candidates.removeAll(where: { isCaptured(referenceTo: $0, occurringIn: AnyScopeID(d)) })
+    candidates.removeAll(where: { isCaptured(referenceTo: $0, occurringIn: s) })
     if candidates.isEmpty { return nil }
 
     guard let pick = candidates.uniqueElement else {
@@ -3067,7 +3479,7 @@ struct TypeChecker {
     }
 
     if program.isMember(pick) {
-      return ("self", lookup(unqualified: "self", in: AnyScopeID(d)).uniqueElement!)
+      return ("self", lookup(unqualified: "self", in: s).uniqueElement!)
     } else {
       return (n.value.stem, pick)
     }
@@ -3257,14 +3669,11 @@ struct TypeChecker {
     if let x = n.notation, x != operatorNotation(d) { return nil }
 
     // If the looked up name has an introducer, return the corresponding implementation.
-    if let introducer = n.introducer {
-      guard let m = program.ast[MethodDecl.ID(d)] else { return nil }
-      return m.impls.first(where: { (i) in
-        program[i].introducer.value == introducer
-      }).map(AnyDeclID.init(_:))
+    return n.introducer.map(default: d) { (k) in
+      MethodDecl.ID(d)
+        .flatMap({ (m) in program.ast.implementation(k, of: m) })
+        .flatMap(AnyDeclID.init(_:))
     }
-
-    return d
   }
 
   /// Returns the labels of `d`s name.
@@ -3288,13 +3697,13 @@ struct TypeChecker {
   }
 
   /// Returns the labels of `d`s name.
-  private mutating func labels(_ d: FunctionDecl.ID) -> [String?] {
+  private func labels(_ d: FunctionDecl.ID) -> [String?] {
     program.ast[program[FunctionDecl.ID(d)!].parameters].map(\.label?.value)
   }
 
   /// Returns the labels of `d`s name.
   private mutating func labels(_ d: InitializerDecl.ID) -> [String?] {
-    if let t = LambdaType(uncheckedType(of: d)) {
+    if let t = ArrowType(uncheckedType(of: d)) {
       return Array(t.labels)
     } else if !program[d].isMemberwise {
       return ["self"] + program.ast[program[d].parameters].map(\.label?.value)
@@ -3351,6 +3760,87 @@ struct TypeChecker {
     }
   }
 
+  /// Returns the innermost nominal scope in which `d` is contained, if any.
+  private mutating func nominalParent(of d: AnyDeclID) -> AnyScopeID? {
+    guard let p = program.nodeToScope[d] else {
+      assert(d.kind == ModuleDecl.self)
+      return nil
+    }
+
+    switch p.kind {
+    case ModuleDecl.self, NamespaceDecl.self, ProductTypeDecl.self, TypeAliasDecl.self:
+      return p
+    case ConformanceDecl.self:
+      return scopeExtended(by: ConformanceDecl.ID(p)!)
+    case ExtensionDecl.self:
+      return scopeExtended(by: ExtensionDecl.ID(p)!)
+    case MethodDecl.self:
+      return nominalParent(of: AnyDeclID(p)!)
+    case SubscriptDecl.self:
+      return nominalParent(of: AnyDeclID(p)!)
+    case TranslationUnit.self:
+      return program.nodeToScope[p]!
+    default:
+      return nil
+    }
+  }
+
+  /// Returns `true` iff a qualified reference to `d` is visible in `scopeOfUse`.
+  ///
+  /// Qualified name lookup may "see" a declaration `d` iff one the following holds:
+  /// - `d` is declared public.
+  /// - `d` is a trait requirement.
+  /// - `d` is declared internal and `scopeOfUse` is in the same scope.
+  /// - `d` is declared private and the innermost scope enclosing `d` also encloses `scopeOfUse`.
+  private mutating func isAccessibleWithQualification(
+    _ d: AnyDeclID, in scopeOfUse: AnyScopeID
+  ) -> Bool {
+    if let v = VarDecl.ID(d) {
+      return isAccessibleWithQualification(AnyDeclID(program[v].binding), in: scopeOfUse)
+    } else if d.isBundleImpl {
+      return isAccessibleWithQualification(AnyDeclID(program[d].scope)!, in: scopeOfUse)
+    } else if program.isRequirement(d) {
+      return true
+    }
+
+    // Note: direct access to the AST is necessary to support the cast to `ExposableDecl`.
+    let modifier = (program.ast[d] as? ExposableDecl)?.accessModifier.value
+
+    if modifier == .public {
+      return true
+    } else if !program.areInSameModule(d, scopeOfUse) {
+      return false
+    } else if modifier == .internal {
+      return true
+    } else if let p = nominalParent(of: d) {
+      return isNotionallyContained(scopeOfUse, in: p)
+    } else {
+      return d.kind == ModuleDecl.self
+    }
+  }
+
+  /// Returns `true` if `child` is lexically contained in or in an extension of `ancestor`.
+  private mutating func isNotionallyContained<T: NodeIDProtocol, U: ScopeID>(
+    _ child: T, in ancestor: U
+  ) -> Bool {
+    if child.rawValue == ancestor.rawValue { return true }
+
+    switch child.kind {
+    case ConformanceDecl.self:
+      return scopeExtended(by: ConformanceDecl.ID(child)!)
+        .map({ $0.rawValue == ancestor.rawValue }) ?? program.isContained(child, in: ancestor)
+    case ExtensionDecl.self:
+      return scopeExtended(by: ExtensionDecl.ID(child)!)
+        .map({ $0.rawValue == ancestor.rawValue }) ?? program.isContained(child, in: ancestor)
+    default:
+      if let n = program.nodeToScope[child] {
+        return isNotionallyContained(n, in: ancestor)
+      } else {
+        return false
+      }
+    }
+  }
+
   // MARK: Name resolution
 
   /// Resolves components of `n` from left to right until all components have been resolved or one
@@ -3391,10 +3881,14 @@ struct TypeChecker {
     while let component = unresolved.popLast() {
       // `purpose` only applies to the last component.
       let u = unresolved.isEmpty ? purpose : .unapplied
-      let candidates = resolve(component, in: parent, usedAs: u)
+      var candidates = resolve(component, in: parent, usedAs: u)
 
       // Resolution failed if we found no candidates.
       if candidates.isEmpty { return .failed }
+
+      if candidates.count > 1 {
+        candidates = filterResolutionCandidates(candidates, in: program[component].scope)
+      }
 
       // Append the resolved component to the nominal prefix.
       resolved.append(.init(component, candidates))
@@ -3437,7 +3931,12 @@ struct TypeChecker {
       if let c = candidates.elements.uniqueElement {
         report(c.diagnostics.elements)
       } else {
-        report(.error(noViableCandidateToResolve: name, notes: []))
+        let notes = candidates.elements.map { (c) -> Diagnostic in
+          let s = c.reference.decl.map(program.ast.siteForDiagnostics(about:))
+          let m = c.diagnostics.elements.min(by: Diagnostic.isLoggedBefore)?.message
+          return .note(m ?? "candidate not viable", at: s ?? name.site)
+        }
+        report(.error(noViableCandidateToResolve: name, notes: notes))
       }
       return []
     }
@@ -3460,26 +3959,29 @@ struct TypeChecker {
     _ name: SourceRepresentable<Name>, specializedBy arguments: [CompileTimeValue],
     in context: NameResolutionContext?, exposedTo scopeOfUse: AnyScopeID, usedAs purpose: NameUse
   ) -> NameResolutionResult.CandidateSet {
-    // Resolve references to the built-in symbols.
+    // Built-in symbols are handled separately.
     if context?.type == .builtin(.module) {
       return resolve(builtin: name)
     }
 
-    // Gather declarations qualified by `parent` if it isn't `nil` or unqualified otherwise.
-    let matches = lookup(name, memberOf: context?.type, exposedTo: scopeOfUse)
+    let isQualified = context != nil
 
-    // Resolve compiler-known type aliases if no match was found.
-    if matches.isEmpty {
-      if context == nil {
+    // Compute the set of all possible matches and filter out those that are inaccessible.
+    let allMatches = lookup(name, memberOf: context?.type, exposedTo: scopeOfUse)
+    let accessibleMatches = filterAccessible(allMatches)
+
+    // Attempt to resolve a compiler-known alias if there's no match and `name` occurs unqualified.
+    if accessibleMatches.isEmpty {
+      if !isQualified {
         return resolve(compilerKnownAlias: name, specializedBy: arguments, exposedTo: scopeOfUse)
-      } else {
-        return []
+      } else if !allMatches.isEmpty {
+        report(.error(invalidReferenceToInaccessible: allMatches, named: name, in: program.ast))
       }
     }
 
     // Create declaration references to all candidates.
     var candidates: NameResolutionResult.CandidateSet = []
-    for m in matches {
+    for m in accessibleMatches {
       var log = DiagnosticSet()
 
       let t = resolveType(
@@ -3501,14 +4003,16 @@ struct TypeChecker {
         continue
       }
 
-      if (context?.type.base is TraitType) && (m.kind == AssociatedTypeDecl.self) {
-        log.insert(.error(invalidUseOfAssociatedType: name.value.stem, at: name.site))
+      var deferred: ConstraintSet = []
+      forEachConstraint(associatedWith: m, in: scopeOfUse) { (me, c) in
+        let k = me.evaluateResolutionConstraint(
+          c, associatedWith: name, specializedBy: specialization, in: scopeOfUse,
+          reportingDiagnosticsTo: &log)
+        if let k = k { deferred.insert(k) }
       }
 
-      let cs = collectConstraints(
-        associatedWith: m, specializedBy: specialization, in: scopeOfUse, at: name.site)
       candidates.insert(
-        .init(reference: r, type: candidateType, constraints: cs, diagnostics: log))
+        .init(reference: r, type: candidateType, constraints: deferred, diagnostics: log))
     }
 
     if let labels = purpose.labels {
@@ -3516,6 +4020,23 @@ struct TypeChecker {
     }
 
     return candidates
+
+    /// If `isQualified` is `true`, returns the declarations in `ds` that are accessible with
+    /// qualification in `scopeOfUse`. Otherwise, returns `ds`.
+    func filterAccessible(_ ds: [AnyDeclID]) -> [AnyDeclID] {
+      if !isQualified { return ds }
+      let tentative = ds.filter({ isAccessibleWithQualification($0, in: scopeOfUse) })
+
+      if !tentative.isEmpty {
+        return tentative
+      } else if isQualified && ds.contains(where: { $0.kind == GenericParameterDecl.self }) {
+        let membersOfConformedTraits = conformedTraits(of: context!.type, in: scopeOfUse)
+          .map({ lookup(name, memberOf: AnyType($0), exposedTo: scopeOfUse) })
+        return filterAccessible(Array(Set(membersOfConformedTraits.joined())))
+      } else {
+        return []
+      }
+    }
   }
 
   /// Returns the declaration of `name` interpreted as a member of the built-in module.
@@ -3619,7 +4140,7 @@ struct TypeChecker {
     }
 
     switch purpose {
-    case .constructor(let ls), .function(let ls):
+    case .constructor(let ls), .function(let ls, _):
       guard let t = MetatypeType(parent.type)?.instance else { return nil }
       let n = SourceRepresentable(value: Name(stem: "init"), range: name.site)
       let p = NameResolutionContext(type: t, arguments: parent.arguments, receiver: nil)
@@ -3638,6 +4159,31 @@ struct TypeChecker {
     }
   }
 
+  /// Returns the candidates `cs` that are viable picks for overload resolution in `scopeOfUse`.
+  private mutating func filterResolutionCandidates(
+    _ cs: [NameResolutionResult.Candidate], in scopeOfUse: AnyScopeID
+  ) -> [NameResolutionResult.Candidate] {
+    var candidatesByType: [AnyType: [Int]] = [:]
+    for (i, c) in cs.enumerated() {
+      let t = canonical(c.type, in: scopeOfUse)
+      candidatesByType[t, default: []].append(i)
+    }
+
+    var result: [NameResolutionResult.Candidate] = []
+    for (_, group) in candidatesByType {
+      let viable = group.minimalElements { (a, b) in
+        guard
+          let lhs = cs[a].reference.decl,
+          let rhs = cs[b].reference.decl
+        else { return nil }
+        return compareDepth(lhs, rhs, in: scopeOfUse)
+      }
+      result.append(contentsOf: viable.map({ (i) in cs[i] }))
+    }
+
+    return result
+  }
+
   /// Returns the resolved type of the entity declared by `d` when referred to by `name` with
   /// the given `arguments`, or `nil` if `d` is ill-formed.
   ///
@@ -3645,7 +4191,7 @@ struct TypeChecker {
   /// the specialization of the returned type is performed in `scopeOfUse`. Diagnostics of errors
   /// related to the construction of the generic argument list are stored in `log`.
   ///
-  /// If `d` declares an initializer and and `purpose` is `.constructor`, the returned type is the
+  /// If `d` declares an initializer and `purpose` is `.constructor`, the returned type is the
   /// constructor form of `d`'s type.
   private mutating func resolveType(
     of d: AnyDeclID,
@@ -3655,29 +4201,30 @@ struct TypeChecker {
     exposedTo scopeOfUse: AnyScopeID,
     usedAs purpose: NameUse,
     reportingDiagnosticsTo log: inout DiagnosticSet
-  ) -> (candidateType: AnyType, specialization: GenericArguments, isConstructor: Bool)? {
-    guard var candidateType = resolveType(of: d) else { return nil }
+  ) -> (type: AnyType, specialization: GenericArguments, isConstructor: Bool)? {
+    var entityType = resolveType(
+      of: d, lookedUpIn: context, exposedTo: scopeOfUse, reportingDiagnosticsAt: name.site)
+    if entityType[.hasError] { return nil }
 
-    // The specialization of the match includes that of context in which it was looked up.
-    var specialization = genericArguments(inScopeIntroducing: d, resolvedIn: context)
-    candidateType = specialize(candidateType, for: specialization, in: scopeOfUse)
+    // TODO: Report invalid uses of mutation markers
+
+    // The specialization of the entity includes that of the context in which it was looked up. In
+    // particular, the context may contain information necessary to determine the specialization of
+    // a qualified name. For example, given an instance of `type S<T> { let foo: Array<T> }`, the
+    // type of the member `foo` depends on the specialization of its qualification.
+    var specialization = genericQualificationArguments(inScopeIntroducing: d, resolvedIn: context)
+    entityType = specialize(entityType, for: specialization, in: scopeOfUse)
 
     // Keep track of generic arguments that should be captured later on.
-    let candidateSpecialization = genericArguments(
-      passedTo: d, typed: candidateType, referredToBy: name, specializedBy: arguments,
+    let entityArguments = genericArguments(
+      passedTo: d, typed: entityType, referredToBy: name, specializedBy: arguments,
       reportingDiagnosticsTo: &log)
-    for (p, a) in candidateSpecialization {
+    for (p, a) in entityArguments {
       specialization[p] = a
     }
 
-    // If the match is a trait member looked, specialize its receiver.
-    // TODO: Remove `mayCaptureGenericParameters` when
-    if let t = traitDeclaring(d), mayCaptureGenericParameters(d) {
-      // DR: `mayCaptureGenericParameters` is used to avoid populating the specialization table
-      // when `m` is an associated type declaration. Otherwise, `specialize` causes resolution
-      // to systematically pick the default value. I suspect that `specialize` shouldn't do that
-      // when the associated type is rooted at a trait. Substitution of associated type should
-      // rely on conformances rather than lookup.
+    // If the match is a trait member, specialize its receiver.
+    if let t = traitDeclaring(d) {
       if let r = context?.type ?? resolveReceiverMetatype(in: scopeOfUse)?.instance {
         specialization[program[t.decl].receiver] = .type(r)
       }
@@ -3687,44 +4234,147 @@ struct TypeChecker {
     let isConstructor =
       (d.kind == InitializerDecl.self) && (purpose.isConstructor || (name.value.stem == "new"))
     if isConstructor {
-      candidateType = ^LambdaType(constructorFormOf: LambdaType(candidateType)!)
+      entityType = ^ArrowType(constructorFormOf: ArrowType(entityType)!)
     }
 
     // If the receiver is an existential, replace its receiver.
     if let container = ExistentialType(context?.type) {
-      candidateType = candidateType.asMember(of: container)
+      entityType = entityType.asMember(of: container)
       if let t = traitDeclaring(d) {
         specialization[program[t.decl].receiver] = .type(^WitnessType(of: container))
       }
     }
 
-    // Re-specialize the candidate's type now that the substitution map is complete.
-    //
-    // The specialization map now contains the substitutions accumulated from the candidate's
-    // qualification as well as the ones related to the resolution of the candidate itself. For
-    // example, if we resolved `A<X>.f<Y>`, we'd get `X` from the resolution of the qualification
-    // and `Y` from the resolution of the candidate.
-    candidateType = specialize(candidateType, for: specialization, in: scopeOfUse)
+    // Re-specialize the candidate's type now that the substitution map is complete contains the
+    // substitutions accumulated from the candidate's qualification as well as the ones related to
+    // the resolution of the candidate itself. For example, if we resolved `A<X>.f<Y>`, we'd get
+    // `X` from the resolution of the qualification and `Y` from the resolution of the candidate.
+    entityType = specialize(entityType, for: specialization, in: scopeOfUse)
 
-    return (candidateType, specialization, isConstructor)
+    var capturedArguments = GenericArguments.empty
+    for p in capturedGenericParameter(of: d) {
+      capturedArguments[p] = specialization[p]
+    }
+
+    return (entityType, capturedArguments, isConstructor)
   }
 
-  /// Returns the resolved type of the entity declared by `d` or `nil` if `d` is ill-formed.
-  private mutating func resolveType(of d: AnyDeclID) -> AnyType? {
-    var result = uncheckedType(of: d)
-    if result.isError { return nil }
+  /// Returns the generic type of a reference to `d`, found in `context`, reporting diagnostics
+  /// at `diagnosticSite`.
+  private mutating func resolveType(
+    of d: AnyDeclID, lookedUpIn context: NameResolutionContext? = nil,
+    exposedTo scopeOfUse: AnyScopeID,
+    reportingDiagnosticsAt diagnosticSite: SourceRange
+  ) -> AnyType {
+    switch d.kind {
+    case AssociatedTypeDecl.self:
+      return resolveType(
+        of: AssociatedTypeDecl.ID(d)!, lookedUpIn: context, exposedTo: scopeOfUse,
+        reportingDiagnosticsAt: diagnosticSite)
+
+    case SubscriptDecl.self:
+      return resolveType(of: SubscriptDecl.ID(d)!, lookedUpIn: context)
+
+    default:
+      break
+    }
+
+    let result = uncheckedType(of: d)
+    if let t = ParameterType(result) {
+      return t.bareType
+    } else {
+      return result
+    }
+  }
+
+  /// Returns the generic type of a reference to `d`, found in `context` and occurring in
+  /// `scopeOfUse`, reporting diagnostics at `diagnosticSite`.
+  private mutating func resolveType(
+    of d: AssociatedTypeDecl.ID, lookedUpIn context: NameResolutionContext?,
+    exposedTo scopeOfUse: AnyScopeID,
+    reportingDiagnosticsAt diagnosticSite: SourceRange
+  ) -> AnyType {
+    if let qualification = context {
+      return resolveType(
+        of: d, qualifiedBy: qualification.type, exposedTo: scopeOfUse,
+        reportingDiagnosticsAt: diagnosticSite)
+    } else if let s = resolveTraitReceiver(in: scopeOfUse) {
+      // The domain of associated type resolved without qualification is a skolem bound by the
+      // trait in which the reference to `d` occurs.
+      return ^MetatypeType(of: AssociatedTypeType(d, domain: ^s, ast: program.ast))
+    } else {
+      report(.error(invalidReferenceToAssociatedType: d, at: diagnosticSite, in: program.ast))
+      return .error
+    }
+  }
+
+  /// Returns the generic type of a reference to `d`, occurring qualified by `domain` in
+  /// `scopeOfUse`, reporting diagnostics at `diagnosticSite`.
+  private mutating func resolveType(
+    of d: AssociatedTypeDecl.ID, qualifiedBy domain: AnyType,
+    exposedTo scopeOfUse: AnyScopeID,
+    reportingDiagnosticsAt diagnosticSite: SourceRange
+  ) -> AnyType {
+    // Skolems are valid associated type qualifications.
+    if domain.isSkolem {
+      return ^MetatypeType(of: AssociatedTypeType(d, domain: domain, ast: program.ast))
+    }
+
+    // Associated type declarations shall not be referred to outside of a generic context.
+    else if domain.base is TraitType {
+      report(.error(invalidReferenceToAssociatedType: d, at: diagnosticSite, in: program.ast))
+      return uncheckedType(of: d)
+    }
+
+    // Type aliases used a associated type qualification are erased.
+    else if let t = TypeAliasType(domain) {
+      return resolveType(
+        of: d, qualifiedBy: t.resolved, exposedTo: scopeOfUse,
+        reportingDiagnosticsAt: diagnosticSite)
+    }
+
+    // Other qualifications refer to conformances.
+    else {
+      return resolveType(
+        of: d, implementedBy: domain, forConformanceExposedTo: scopeOfUse,
+        reportingDiagnosticsAt: diagnosticSite)
+    }
+  }
+
+  /// Returns the generic type of a reference to `d`, which is implemented by `domain` for a
+  /// conformance exposed to `scopeOfUse`, reporting diagnostics at `diagnosticSite`.
+  ///
+  /// `domain` is notionally the subject of a conformance lens focusing on its conformance to the
+  /// trait that declared `d`.
+  private mutating func resolveType(
+    of d: AssociatedTypeDecl.ID, implementedBy domain: AnyType,
+    forConformanceExposedTo scopeOfUse: AnyScopeID,
+    reportingDiagnosticsAt diagnosticSite: SourceRange
+  ) -> AnyType {
+    let lens = traitDeclaring(d)!
+    if
+      let c = demandConformance(of: domain, to: lens, exposedTo: scopeOfUse),
+      let i = c.implementations[d]?.decl
+    {
+      return uncheckedType(of: i)
+    } else {
+      report(.error(domain, doesNotConformTo: lens, at: diagnosticSite))
+      return .error
+    }
+  }
+
+  /// Returns the generic type of a reference to `d`, found in `context`.
+  private mutating func resolveType(
+    of d: SubscriptDecl.ID, lookedUpIn context: NameResolutionContext?
+  ) -> AnyType {
+    let result = uncheckedType(of: d)
 
     // Properties are not first-class.
-    if let s = SubscriptDecl.ID(d), program[s].isProperty {
-      result = SubscriptType(result)!.output
+    if let t = SubscriptType(result), t.isProperty {
+      return t.output
+    } else {
+      return result
     }
-
-    // Erase parameter conventions.
-    if let t = ParameterType(result) {
-      result = t.bareType
-    }
-
-    return result
   }
 
   /// Computes and returns the type of `Self` in `scopeOfUse`.
@@ -3738,8 +4388,6 @@ struct TypeChecker {
       return resolveReceiverMetatype(in: ProductTypeDecl.ID(scopeOfUse)!)
     case TraitDecl.self:
       return resolveReceiverMetatype(in: TraitDecl.ID(scopeOfUse)!)
-    case TypeAliasDecl.self:
-      return resolveReceiverMetatype(in: TypeAliasDecl.ID(scopeOfUse)!)
     case ModuleDecl.self:
       return nil
     default:
@@ -3755,12 +4403,17 @@ struct TypeChecker {
       return nil
     }
 
-    guard let parameters = program[scopeOfUse].genericClause?.value.parameters else {
+    // Nothing more to do if the receiver isn't generic.
+    guard let clause = program[scopeOfUse].genericClause else {
       return unspecialized
     }
 
-    let arguments = GenericArguments(skolemizing: parameters, in: program.ast)
-    return MetatypeType(of: BoundGenericType(unspecialized.instance, arguments: arguments))
+    // Skolemize generic parameters.
+    var a: BoundGenericType.Arguments = [:]
+    for p in clause.value.parameters {
+      a[p] = .type(^GenericTypeParameterType(p, ast: program.ast))
+    }
+    return MetatypeType(of: BoundGenericType(unspecialized.instance, arguments: a))
   }
 
   /// Computes and returns the type of `Self` in `scopeOfUse`.
@@ -3784,6 +4437,16 @@ struct TypeChecker {
     MetatypeType(of: GenericTypeParameterType(selfParameterOf: scopeOfUse, in: program.ast))
   }
 
+  /// Computes and returns the type of `Self` as a trait receiver in `scopeOfUse`, returning `nil`
+  /// if `scopeOfUse` isn't notionally contained in a trait.
+  private mutating func resolveTraitReceiver(
+    in scopeOfUse: AnyScopeID
+  ) -> GenericTypeParameterType? {
+    resolveReceiverMetatype(in: scopeOfUse)
+      .flatMap({ (t) in GenericTypeParameterType(t.instance) })
+      .flatMap({ (t) in isTraitReceiver(t) ? t : nil })
+  }
+
   /// Returns `true` if references to `d` are captured if they occur in `scopeOfUse`.
   private mutating func isCaptured(
     referenceTo d: AnyDeclID, occurringIn scopeOfUse: AnyScopeID
@@ -3801,54 +4464,51 @@ struct TypeChecker {
     // Capture-less functions are not captured.
     if d.kind == FunctionDecl.self {
       return areEquivalent(
-        LambdaType(uncheckedType(of: d))?.environment ?? .error, .void, in: scopeOfUse)
+        ArrowType(uncheckedType(of: d))?.environment ?? .error, .void, in: scopeOfUse)
     } else {
       return true
     }
   }
 
-  /// Returns the list of generic arguments passed to `d`, which has type `t` and is being referred
-  /// to by `name`, reporting diagnostics to `log`.
-  private mutating func genericArguments(
+  /// Returns the generic arguments passed to `d`, which has type `t` and is being referred to by
+  /// `name`, reporting diagnostics to `log`.
+  private func genericArguments(
     passedTo d: AnyDeclID, typed t: AnyType,
     referredToBy name: SourceRepresentable<Name>, specializedBy arguments: [CompileTimeValue],
     reportingDiagnosticsTo log: inout DiagnosticSet
   ) -> GenericArguments {
     if let g = BoundGenericType(t) {
       assert(arguments.isEmpty, "generic declaration bound twice")
-      return g.arguments
+      return .init(g)
     } else {
       let p = program.ast.genericParameters(introducedBy: d)
       return associateGenericParameters(p, of: name, to: arguments, reportingDiagnosticsTo: &log)
     }
   }
 
-  /// Returns the list of generic arguments passed to a symbol occurring in `scope` of use and
-  /// looked up in `context`.
+  /// Returns the generic arguments passed to the qualification of symbols introduced in `d` that
+  /// that have been looked up in `context`.
   ///
   /// The arguments of `context` are returned if the latter isn't `nil`. Otherwise, the arguments
-  /// captured in the scope introducing `d` are returned in the form of a table mapping accumulated
-  /// generic parameters to a skolem.
-  private mutating func genericArguments(
+  /// captured in the scope introducing `d` are returned as a table mapping accumulated generic
+  /// parameters to a skolem.
+  private mutating func genericQualificationArguments(
     inScopeIntroducing d: AnyDeclID, resolvedIn context: NameResolutionContext?
   ) -> GenericArguments {
-    if let a = context?.arguments { return a }
-    if !mayCaptureGenericParameters(d) { return [:] }
-
-    let parameters = accumulatedGenericParameters(in: program[d].scope)
-    return .init(skolemizing: parameters, in: program.ast)
-  }
-
-  /// Returns `true` if a reference to `d` may capture generic parameters from the surrounding
-  /// lookup context.
-  private func mayCaptureGenericParameters(_ d: AnyDeclID) -> Bool {
-    d.kind.value is GenericScope.Type
+    if let c = context {
+      return c.arguments
+    } else if d.isGenericScope {
+      let parameters = accumulatedGenericParameters(in: program[d].scope)
+      return .init(skolemizing: parameters, in: program.ast)
+    } else {
+      return .empty
+    }
   }
 
   /// Associates `parameters`, which are introduced by `name`'s declaration, to corresponding
   /// values in `arguments` if the two arrays have the same length; returns `nil` otherwise,
   /// reporting diagnostics to `log`.
-  private mutating func associateGenericParameters(
+  private func associateGenericParameters(
     _ parameters: [GenericParameterDecl.ID], of name: SourceRepresentable<Name>,
     to arguments: [CompileTimeValue],
     reportingDiagnosticsTo log: inout DiagnosticSet
@@ -3869,94 +4529,112 @@ struct TypeChecker {
     return result
   }
 
-  /// Returns the type checking constraints associated with a reference to `d` in `scopeOfUse`,
-  /// anchoring those constraints at `site`.
-  private mutating func collectConstraints(
-    associatedWith d: AnyDeclID, specializedBy specialization: GenericArguments,
-    in scopeOfUse: AnyScopeID, at site: SourceRange
-  ) -> ConstraintSet {
+  /// Calls `action` on `self` and each constraint that must hold for a reference to `d` occurring
+  /// in `scopeOfUse`.
+  private mutating func forEachConstraint(
+    associatedWith d: AnyDeclID, in scopeOfUse: AnyScopeID,
+    do action: (inout Self, GenericConstraint) -> Void
+  ) {
     switch d.kind {
     case ModuleDecl.self:
-      // Modules have no constraints.
-      return []
-
+      return  // Modules have no constraints.
     case AssociatedTypeDecl.self, AssociatedValueDecl.self:
-      // A reference to an associated type and value must already satisfied the constraints
-      // associated with its scope.
-      return []
-
+      return  // Constraints on associated types and values are assumed in their scope.
+    case TraitDecl.self:
+      return  // References to traits are unconstrained.
     default:
       break
+    }
+
+    if let e = possiblyPartiallyFormedEnvironment(of: d) {
+      for c in e.constraints { action(&self, c) }
     }
 
     let lca = program.innermostCommonScope(program[d].scope, scopeOfUse)
-    let origin = ConstraintOrigin(.whereClause, at: site)
-    var result = ConstraintSet()
-
     for s in program.scopes(from: program[d].scope) {
       if s == lca { break }
-      if let e = environment(of: s) {
-        for g in e.constraints {
-          let c = specialize(g, for: specialization, in: scopeOfUse, origin: origin)
-          result.insert(c)
-        }
+      if let g = AnyDeclID(s), let e = possiblyPartiallyFormedEnvironment(of: g) {
+        for c in e.constraints { action(&self, c) }
       }
     }
-    return result
   }
 
-  /// Returns generic parameters captured by `s` and the scopes semantically containing `s`.
+  /// Checks `c`, which is caused by the resolution of `n` specialized by `z` in `scopeOfUse`,
+  /// reporting diagnostics to `log`.
+  ///
+  /// If the constraint does not contain skolems or open type variables, the result is `nil` and
+  /// a diagnostic is reported to `log` iff the constraint does not hold. Otherwise, the result is
+  /// a type checking constraint that has to be solved in context.
+  private mutating func evaluateResolutionConstraint(
+    _ c: GenericConstraint,
+    associatedWith n: SourceRepresentable<Name>,
+    specializedBy z: GenericArguments,
+    in scopeOfUse: AnyScopeID,
+    reportingDiagnosticsTo log: inout DiagnosticSet
+  ) -> Constraint? {
+    switch c.value {
+    case .conformance(let lhs, let rhs):
+      let a = specialize(lhs, for: z, in: scopeOfUse)
+      if a.isSkolem || a[.hasVariable] {
+        return ConformanceConstraint(a, conformsTo: rhs, origin: .init(.binding, at: n.site))
+      } else if !conforms(a, to: rhs, in: scopeOfUse) {
+        log.insert(
+          .error(referenceTo: n, requires: a, conformsTo: rhs, dueToConstraintAt: c.site))
+      }
+
+    case .equality(let lhs, let rhs):
+      let a = specialize(lhs, for: z, in: scopeOfUse)
+      let b = specialize(rhs, for: z, in: scopeOfUse)
+      if a.isSkolem || a[.hasVariable] || b.isSkolem || b[.hasVariable] {
+        return EqualityConstraint(a, b, origin: .init(.binding, at: n.site))
+      } else if !areEquivalent(a, b, in: scopeOfUse) {
+        log.insert(
+          .error(referenceTo: n, requires: a, equals: rhs, dueToConstraintAt: c.site))
+      }
+
+    default:
+      UNIMPLEMENTED()
+    }
+
+    return nil
+  }
+
+  /// Returns the generic parameters introduced in the generic environment of `d`.
+  ///
+  /// If `d` is a variant implementation, the result is the parameters introduce by the containing
+  /// bundle declaration.
+  private mutating func genericParameters(introducedBy d: AnyDeclID) -> [GenericParameterDecl.ID] {
+    if (d.kind == MethodImpl.self) || (d.kind == SubscriptImpl.self) {
+      return genericParameters(introducedBy: AnyDeclID(program[d].scope)!)
+    } else if let s = program.ast[d] as? GenericScope {
+      return s.genericParameters
+    } else {
+      return []
+    }
+  }
+
+  /// Returns the generic parameters captured by `d`.
+  private mutating func capturedGenericParameter<T: DeclID>(of d: T) -> [GenericParameterDecl.ID] {
+    if d.kind == ModuleDecl.self {
+      return []
+    } else {
+      var p = accumulatedGenericParameters(in: program[d].scope)
+      p.append(contentsOf: program.ast.genericParameters(introducedBy: AnyDeclID(d)))
+      return p
+    }
+  }
+
+  /// Returns generic parameters captured by `s`.
   ///
   /// A declaration may take generic parameters even if it doesn't declare any. For example, a
   /// nested function will implicitly capture the generic parameters introduced in its context.
-  ///
-  /// Parameters are returned outer to inner, left to right: the first parameter of the outermost
-  /// generic scope appears first; the last parameter of the innermost generic scope appears last.
-  public mutating func accumulatedGenericParameters<T: ScopeID>(
+  mutating func accumulatedGenericParameters<T: ScopeID>(
     in s: T
-  ) -> ReversedCollection<[GenericParameterDecl.ID]> {
-    var result: [GenericParameterDecl.ID] = []
-    appendGenericParameters(in: s, to: &result)
-    return result.reversed()
-  }
-
-  /// Appends generic parameters captured by `s` and the scopes semantically containing `s` to
-  /// `accumulatedParameters`, right to left, inner to outer.
-  private mutating func appendGenericParameters<T: ScopeID>(
-    in s: T, to accumulatedParameters: inout [GenericParameterDecl.ID]
-  ) {
-    switch s.kind.value {
-    case is ConformanceDecl.Type:
-      appendGenericParameters(in: ConformanceDecl.ID(s)!, to: &accumulatedParameters)
-    case is ExtensionDecl.Type:
-      appendGenericParameters(in: ExtensionDecl.ID(s)!, to: &accumulatedParameters)
-    case is GenericScope.Type:
-      accumulatedParameters.append(contentsOf: (program.ast[s] as! GenericScope).genericParameters)
-    case is TranslationUnit.Type, is ModuleDecl.Type:
-      return
-    default:
-      break
-    }
-
-    appendGenericParameters(in: program[s].scope, to: &accumulatedParameters)
-  }
-
-  /// Appends generic parameters captured by `s` and the scopes semantically containing `s` to
-  /// `accumulatedParameters`, right to left, inner to outer.
-  private mutating func appendGenericParameters<T: TypeExtendingDecl>(
-    in d: T.ID, to accumulatedParameters: inout [GenericParameterDecl.ID]
-  ) {
-    guard let p = scopeExtended(by: d) else { return }
-    appendGenericParameters(in: p, to: &accumulatedParameters)
-  }
-
-  /// Appends generic parameters captured by `s` and the scopes semantically containing `s` to
-  /// `accumulatedParameters`, right to left, inner to outer.
-  private func appendGenericParameters<T: GenericDecl>(
-    in d: T.ID, to accumulatedParameters: inout [GenericParameterDecl.ID]
-  ) {
-    if let clause = program[d].genericClause {
-      accumulatedParameters.append(contentsOf: clause.value.parameters)
+  ) -> [GenericParameterDecl.ID] {
+    if let r = program.scopes(from: s).first(where: \.isGenericScope) {
+      return possiblyPartiallyFormedEnvironment(of: AnyDeclID(r)!)?.parameters ?? []
+    } else {
+      return []
     }
   }
 
@@ -4136,7 +4814,8 @@ struct TypeChecker {
     func transform(
       mutating me: inout Self, _ t: AssociatedTypeType
     ) -> TypeTransformAction {
-      UNIMPLEMENTED("quantifier elimination for associated types (#1043)")
+      let d = t.domain.transform(mutating: &me, transform)
+      return .stepOver(^AssociatedTypeType(t.decl, domain: d, ast: me.program.ast))
     }
 
     func transform(
@@ -4274,17 +4953,20 @@ struct TypeChecker {
     defer { assert(obligations.exprType[e] != nil) }
 
     switch e.kind {
+    case ArrowTypeExpr.self:
+      return _inferredType(of: ArrowTypeExpr.ID(e)!, withHint: hint, updating: &obligations)
     case BooleanLiteralExpr.self:
       return _inferredType(of: BooleanLiteralExpr.ID(e)!, withHint: hint, updating: &obligations)
     case BufferLiteralExpr.self:
       return _inferredType(of: BufferLiteralExpr.ID(e)!, withHint: hint, updating: &obligations)
+    case CaptureExpr.self:
+      return _inferredType(of: CaptureExpr.ID(e)!, withHint: hint, updating: &obligations)
     case CastExpr.self:
       return _inferredType(of: CastExpr.ID(e)!, withHint: hint, updating: &obligations)
     case ConditionalExpr.self:
       return _inferredType(of: ConditionalExpr.ID(e)!, withHint: hint, updating: &obligations)
-    case ConformanceLensTypeExpr.self:
-      return _inferredType(
-        of: ConformanceLensTypeExpr.ID(e)!, withHint: hint, updating: &obligations)
+    case ConformanceLensExpr.self:
+      return _inferredType(of: ConformanceLensExpr.ID(e)!, withHint: hint, updating: &obligations)
     case ExistentialTypeExpr.self:
       return _inferredType(of: ExistentialTypeExpr.ID(e)!, withHint: hint, updating: &obligations)
     case FloatLiteralExpr.self:
@@ -4297,16 +4979,14 @@ struct TypeChecker {
       return _inferredType(of: IntegerLiteralExpr.ID(e)!, withHint: hint, updating: &obligations)
     case LambdaExpr.self:
       return _inferredType(of: LambdaExpr.ID(e)!, withHint: hint, updating: &obligations)
-    case LambdaTypeExpr.self:
-      return _inferredType(of: LambdaTypeExpr.ID(e)!, withHint: hint, updating: &obligations)
     case MatchExpr.self:
       return _inferredType(of: MatchExpr.ID(e)!, withHint: hint, updating: &obligations)
     case NameExpr.self:
       return _inferredType(of: NameExpr.ID(e)!, withHint: hint, updating: &obligations)
     case PragmaLiteralExpr.self:
       return _inferredType(of: PragmaLiteralExpr.ID(e)!, withHint: hint, updating: &obligations)
-    case RemoteExpr.self:
-      return _inferredType(of: RemoteExpr.ID(e)!, withHint: hint, updating: &obligations)
+    case RemoteTypeExpr.self:
+      return _inferredType(of: RemoteTypeExpr.ID(e)!, withHint: hint, updating: &obligations)
     case SequenceExpr.self:
       return _inferredType(of: SequenceExpr.ID(e)!, withHint: hint, updating: &obligations)
     case StringLiteralExpr.self:
@@ -4324,6 +5004,30 @@ struct TypeChecker {
     default:
       unexpected(e, in: program.ast)
     }
+  }
+
+  /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
+  /// from `hint`.
+  private mutating func _inferredType(
+    of e: ArrowTypeExpr.ID, withHint hint: AnyType? = nil,
+    updating obligations: inout ProofObligations
+  ) -> AnyType {
+    let environment: AnyType
+    if let v = program[e].environment {
+      environment = evalPartialTypeAnnotation(v, updating: &obligations) ?? .error
+    } else {
+      environment = .any
+    }
+
+    let inputs = evalParameterAnnotations(of: e)
+    let output = evalTypeAnnotation(program[e].output)
+
+    let r = ^ArrowType(
+      receiverEffect: program[e].receiverEffect?.value ?? .let,
+      environment: environment,
+      inputs: inputs,
+      output: output)
+    return constrain(e, to: ^MetatypeType(of: r), in: &obligations)
   }
 
   /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
@@ -4348,7 +5052,7 @@ struct TypeChecker {
       elementHint = ^freshVariable()
     }
 
-    // If the buffer has no element, we keep the element type open. Othewise, we use the type of
+    // If the buffer has no element, we keep the element type open. Otherwise, we use the type of
     // the first element to constrain all others.
     if let elements = program[e].elements.headAndTail {
       let head = inferredType(of: elements.head, withHint: elementHint, updating: &obligations)
@@ -4363,6 +5067,17 @@ struct TypeChecker {
     } else {
       return constrain(e, to: ^BufferType(elementHint, .compilerKnown(0)), in: &obligations)
     }
+  }
+
+  /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
+  /// from `hint`.
+  private mutating func _inferredType(
+    of e: CaptureExpr.ID, withHint hint: AnyType? = nil,
+    updating obligations: inout ProofObligations
+  ) -> AnyType {
+    let t = inferredType(
+      of: program[e].source, withHint: RemoteType(hint)?.bareType, updating: &obligations)
+    return constrain(e, to: ^RemoteType(program[e].access.value, t), in: &obligations)
   }
 
   /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
@@ -4384,26 +5099,26 @@ struct TypeChecker {
       // Note: constraining the type of the LHS to be above the RHS wouldn't contribute any useful
       // information to the constraint system.
       _ = inferredType(of: program[e].left, updating: &obligations)
+      return constrain(e, to: rhs.shape, in: &obligations)
 
     case .up:
       // The type of the LHS must be statically known to subtype of the RHS.
       let lhs = inferredType(
         of: program[e].left, withHint: ^freshVariable(), updating: &obligations)
       obligations.insert(SubtypingConstraint(lhs, rhs.shape, origin: cause))
+      return constrain(e, to: rhs.shape, in: &obligations)
 
     case .pointerConversion:
       // The LHS be a `Builtin.ptr`. The RHS must be a remote type.
-      if !(rhs.shape.base is RemoteType) {
+      guard let s = RemoteType(rhs.shape) else {
         report(.error(invalidPointerConversionAt: program[e].right.site))
         return constrain(e, to: .error, in: &obligations)
       }
 
       let lhs = inferredType(of: program[e].left, updating: &obligations)
       obligations.insert(EqualityConstraint(lhs, .builtin(.ptr), origin: cause))
+      return constrain(e, to: s.bareType, in: &obligations)
     }
-
-    // Unless an error occurred, the inferred type is `rhs`.
-    return constrain(e, to: rhs.shape, in: &obligations)
   }
 
   /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
@@ -4424,7 +5139,7 @@ struct TypeChecker {
   }
 
   private mutating func _inferredType(
-    of e: ConformanceLensTypeExpr.ID, withHint hint: AnyType? = nil,
+    of e: ConformanceLensExpr.ID, withHint hint: AnyType? = nil,
     updating obligations: inout ProofObligations
   ) -> AnyType {
     guard
@@ -4480,11 +5195,8 @@ struct TypeChecker {
     of e: FunctionCallExpr.ID, withHint hint: AnyType? = nil,
     updating obligations: inout ProofObligations
   ) -> AnyType {
-    let u = NameUse.function(labels: program[e].arguments.map(\.label?.value))
-    let callee = _inferredType(
-      ofCallee: program[e].callee, usedAs: u, withHint: hint, updating: &obligations)
-
-    // We failed to infer the type of the callee. We can stop here.
+    // We need the type of the callee to infer anything further.
+    let callee = inferredCalleeType(of: e, implicitlyIn: hint, updating: &obligations)
     if callee.isError {
       return constrain(e, to: .error, in: &obligations)
     }
@@ -4512,10 +5224,16 @@ struct TypeChecker {
       arguments.append(.init(label: a.label, type: p, valueSite: program[a.value].site))
     }
 
-    let output = ((callee.base as? CallableType)?.output ?? hint) ?? ^freshVariable()
+    let isMutating = program.ast.isMarkedForMutation(program[e].callee)
+    let output =
+      (callee.base as? CallableType)?.outputOfUse(mutable: isMutating)
+      ?? hint
+      ?? ^freshVariable()
+
     obligations.insert(
       CallConstraint(
-        arrow: callee, takes: arguments, gives: output, in: .ast(AnyExprID(e)),
+        arrow: callee, usedMutably: isMutating,
+        takes: arguments, gives: output, in: .ast(AnyExprID(e)),
         origin: .init(.callee, at: program[e].callee.site)))
 
     return constrain(e, to: output, in: &obligations)
@@ -4524,7 +5242,7 @@ struct TypeChecker {
   /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
   /// from `hint`.
   private mutating func _inferredType(
-    of e: InoutExpr.ID, withHint hint: AnyType? = nil,
+    of e: InoutExpr.ID, usedAs purpose: NameUse = .unapplied, withHint hint: AnyType? = nil,
     updating obligations: inout ProofObligations
   ) -> AnyType {
     let t = inferredType(of: program[e].subject, withHint: hint, updating: &obligations)
@@ -4547,7 +5265,7 @@ struct TypeChecker {
     of e: LambdaExpr.ID, withHint hint: AnyType? = nil,
     updating obligations: inout ProofObligations
   ) -> AnyType {
-    let h = LambdaType(hint)
+    let h = ArrowType(hint)
     let d = program[e].decl.id
     let inputs = uncheckedInputTypes(of: e, withHint: h)
 
@@ -4570,36 +5288,12 @@ struct TypeChecker {
       effect = .let
     }
 
-    let result = ^LambdaType(
+    let result = ^ArrowType(
       receiverEffect: effect,
       environment: ^environment,
       inputs: inputs, output: output)
     obligations.assign(result, to: AnyDeclID(d))
     return constrain(e, to: result, in: &obligations)
-  }
-
-  /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
-  /// from `hint`.
-  private mutating func _inferredType(
-    of e: LambdaTypeExpr.ID, withHint hint: AnyType? = nil,
-    updating obligations: inout ProofObligations
-  ) -> AnyType {
-    let environment: AnyType
-    if let v = program[e].environment {
-      environment = evalPartialTypeAnnotation(v, updating: &obligations) ?? .error
-    } else {
-      environment = .any
-    }
-
-    let inputs = evalParameterAnnotations(of: e)
-    let output = evalTypeAnnotation(program[e].output)
-
-    let r = ^LambdaType(
-      receiverEffect: program[e].receiverEffect?.value ?? .let,
-      environment: environment,
-      inputs: inputs,
-      output: output)
-    return constrain(e, to: ^MetatypeType(of: r), in: &obligations)
   }
 
   /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
@@ -4616,27 +5310,20 @@ struct TypeChecker {
   }
 
   /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
-  /// from `hint`.
+  /// from `hint` and `implicitQualification`.
   ///
-  /// - Parameters:
-  ///   - implicitNominalScope: the type of the nominal scope in which the leftmost component of
-  ///     `e` is resolved if it is implicit (e.g., `.foo.bar`).
-  ///   - purpose: How `e` is used.
+  /// If the leftmost component of `e` is implicit, (e.g., `.foo.bar`), then its next component is
+  /// resolved using qualified name lookup in `implicitQualification`. `purpose` describes the way
+  /// `e` is used.
   private mutating func _inferredType(
-    of e: NameExpr.ID, inImplicitScope implicitNominalScope: AnyType? = nil,
+    of e: NameExpr.ID,
+    implicitlyIn implicitQualification: AnyType? = nil,
     usedAs purpose: NameUse = .unapplied,
     withHint hint: AnyType? = nil,
     updating obligations: inout ProofObligations
   ) -> AnyType {
     let resolution = resolve(e, usedAs: purpose) { (me, n) in
-      switch me.program[n].domain {
-      case .explicit(let e):
-        return me.inferredType(of: e, updating: &obligations)
-      case .implicit:
-        return implicitNominalScope
-      case .none, .operand:
-        unreachable()
-      }
+      me.inferredQualification(of: n, implicitlyIn: implicitQualification, updating: &obligations)
     }
 
     let unresolved: [NameExpr.ID]
@@ -4660,14 +5347,14 @@ struct TypeChecker {
     }
 
     // Create the necessary constraints to let the solver resolve the remaining components.
-    for (i, component) in unresolved.enumerated() {
+    for i in (0 ..< unresolved.count).reversed() {
       let memberType = ^freshVariable()
       obligations.insert(
         MemberConstraint(
-          lastVisited!, hasMember: memberType, referredToBy: component, in: program.ast,
-          usedAs: (i == unresolved.count - 1) ? purpose : .unapplied,
-          origin: ConstraintOrigin(.member, at: program[component].site)))
-      lastVisited = constrain(component, to: memberType, in: &obligations)
+          lastVisited!, hasMember: memberType, referredToBy: unresolved[i], in: program.ast,
+          usedAs: (i == 0) ? purpose : .unapplied,
+          origin: ConstraintOrigin(.member, at: program[unresolved[i]].site)))
+      lastVisited = constrain(unresolved[i], to: memberType, in: &obligations)
     }
 
     return lastVisited!
@@ -4689,12 +5376,12 @@ struct TypeChecker {
 
   /// Returns the inferred type of `e`, using `hint` for context and updating `obligations`.
   private mutating func _inferredType(
-    of e: RemoteExpr.ID, withHint hint: AnyType? = nil,
+    of e: RemoteTypeExpr.ID, withHint hint: AnyType? = nil,
     updating obligations: inout ProofObligations
   ) -> AnyType {
-    let t = inferredType(
-      of: program[e].operand, withHint: RemoteType(hint)?.bareType, updating: &obligations)
-    return constrain(e, to: ^RemoteType(program[e].convention.value, t), in: &obligations)
+    let t = evalTypeAnnotation(program[e].operand)
+    let r = RemoteType(program[e].convention.value, t)
+    return constrain(e, to: ^MetatypeType(of: r), in: &obligations)
   }
 
   /// Returns the inferred type of `e`, updating `obligations` and gathering contextual information
@@ -4742,6 +5429,7 @@ struct TypeChecker {
       obligations.insert(
         CallConstraint(
           arrow: operatorType,
+          usedMutably: program.ast.isMarkedForMutation(lhs),
           takes: [.init(label: nil, type: rhsType, valueSite: program.ast.site(of: rhs))],
           gives: outputType,
           in: .infix(e),
@@ -4769,11 +5457,8 @@ struct TypeChecker {
     of e: SubscriptCallExpr.ID, withHint hint: AnyType? = nil,
     updating obligations: inout ProofObligations
   ) -> AnyType {
-    let u = NameUse.subscript(labels: program[e].arguments.map(\.label?.value))
-    let callee = _inferredType(
-      ofCallee: program[e].callee, usedAs: u, withHint: hint, updating: &obligations)
-
-    // We failed to infer the type of the callee. We can stop here.
+    // We need the type of the callee to infer anything further.
+    let callee = inferredCalleeType(of: e, implicitlyIn: hint, updating: &obligations)
     if callee.isError {
       return constrain(e, to: .error, in: &obligations)
     }
@@ -4819,10 +5504,16 @@ struct TypeChecker {
       arguments.append(.init(label: a.label, type: p, valueSite: program[a.value].site))
     }
 
-    let output = ((callee.base as? CallableType)?.output ?? hint) ?? ^freshVariable()
+    let isMutating = program.ast.isMarkedForMutation(program[e].callee)
+    let output =
+      (callee.base as? CallableType)?.outputOfUse(mutable: isMutating)
+      ?? hint
+      ?? ^freshVariable()
+
     obligations.insert(
       CallConstraint(
-        subscript: callee, takes: arguments, gives: output, in: .ast(AnyExprID(e)),
+        subscript: callee, usedMutably: program.ast.isMarkedForMutation(program[e].callee),
+        takes: arguments, gives: output, in: .ast(AnyExprID(e)),
         origin: .init(.callee, at: program[e].callee.site)))
 
     return constrain(e, to: output, in: &obligations)
@@ -4896,18 +5587,48 @@ struct TypeChecker {
     return constrain(e, to: ^MetatypeType(of: r), in: &obligations)
   }
 
-  /// Returns the inferred type of `callee`, which is the callee of a function, initializer, or
-  /// subscript, updating `state` with inference facts and deferred type checking requests.
-  ///
-  /// - Requires: `purpose` is either `.function` or `.subscript`.
-  private mutating func _inferredType(
-    ofCallee callee: AnyExprID, usedAs purpose: NameUse, withHint hint: AnyType?,
+  /// Returns the inferred type of `e`'s callee using `q` to resolve implicit qualifications and
+  /// updating `obligations`.
+  private mutating func inferredCalleeType(
+    of e: FunctionCallExpr.ID, implicitlyIn q: AnyType?,
     updating obligations: inout ProofObligations
   ) -> AnyType {
-    assert(purpose != .unapplied)
-    if let e = NameExpr.ID(callee) {
-      return _inferredType(of: e, inImplicitScope: hint, usedAs: purpose, updating: &obligations)
-    } else {
+    let c = program[e].callee.id
+    let p = NameUse.function(
+      labels: program[e].arguments.map(\.label?.value), mutating: c.kind == InoutExpr.self)
+    return inferredType(ofCallee: c, usedAs: p, implicitlyIn: q, updating: &obligations)
+  }
+
+  /// Returns the inferred type of `e`'s callee using `q` to resolve implicit qualifications and
+  /// updating `obligations`.
+  private mutating func inferredCalleeType(
+    of e: SubscriptCallExpr.ID, implicitlyIn q: AnyType?,
+    updating obligations: inout ProofObligations
+  ) -> AnyType {
+    let c = program[e].callee.id
+    let p = NameUse.subscript(
+      labels: program[e].arguments.map(\.label?.value))
+    return inferredType(ofCallee: c, usedAs: p, implicitlyIn: q, updating: &obligations)
+  }
+
+  /// Returns the inferred type of `callee`, which is a callee used as `purpose`, using `q` to
+  /// resolve implicit qualifications and updating `obligations`.
+  private mutating func inferredType(
+    ofCallee callee: AnyExprID, usedAs purpose: NameUse, implicitlyIn q: AnyType?,
+    updating obligations: inout ProofObligations
+  ) -> AnyType {
+    switch callee.kind {
+    case InoutExpr.self:
+      let e = InoutExpr.ID(callee)!
+      let t = inferredType(
+        ofCallee: program[e].subject, usedAs: purpose, implicitlyIn: q, updating: &obligations)
+      return constrain(callee, to: t, in: &obligations)
+
+    case NameExpr.self:
+      let e = NameExpr.ID(callee)!
+      return _inferredType(of: e, implicitlyIn: q, usedAs: purpose, updating: &obligations)
+
+    default:
       return inferredType(of: callee, updating: &obligations)
     }
   }
@@ -4940,7 +5661,7 @@ struct TypeChecker {
 
     let preferred: ConstraintSet = [
       EqualityConstraint(t, defaultType, origin: cause),
-      SubtypingConstraint(defaultType, h, origin: cause),
+      EqualityConstraint(defaultType, h, origin: cause),
     ]
     let alternative: ConstraintSet = [
       EqualityConstraint(t, h, origin: cause),
@@ -5141,28 +5862,27 @@ struct TypeChecker {
     return nil
   }
 
-  /// Inserts in `obligations` the constraints implied by the result of name resolution for each
-  /// nominal component in `components`.
+  /// Updates `obligations` with the constraints implied by the result of name resolution for each
+  /// element in `components`.
   private mutating func constrain(
     _ components: [NameResolutionResult.ResolvedComponent], in obligations: inout ProofObligations
   ) -> AnyType {
     var last: AnyType?
     var substitutions: [GenericParameterDecl.ID: AnyType] = [:]
     for p in components {
-      last = constrain(p.component, to: p.candidates, in: &obligations, updating: &substitutions)
+      last = constrain(p.component, to: p.candidates, in: &obligations, extending: &substitutions)
     }
     return last!
   }
 
-  /// Inserts in `obligations` the constraint that `name` refers to one of the declarations in
-  /// `candidates`, updating `substitutions` with opened generic parameters, and returning the
-  /// inferred type of `name`.
+  /// Updates `obligations` to constrain `name` as a reference to one of `candidates`, extending
+  /// `substitutions` with opened generic parameters, and returning the inferred type of `name`.
   ///
   /// - Requires: `candidates` is not empty
   private mutating func constrain(
     _ name: NameExpr.ID, to candidates: [NameResolutionResult.Candidate],
     in obligations: inout ProofObligations,
-    updating substitutions: inout [GenericParameterDecl.ID: AnyType]
+    extending substitutions: inout [GenericParameterDecl.ID: AnyType]
   ) -> AnyType {
     precondition(!candidates.isEmpty)
     let site = program[name].site
@@ -5226,12 +5946,12 @@ struct TypeChecker {
     _ obligations: ProofObligations, relatedTo n: T,
     ignoringSharedCache ignoreSharedCache: Bool = false
   ) -> Solution {
-    let solution = tracingInference(relatedTo: n) { (me, isLoggingEnabled) in
+    let solution = tracingInference(relatedTo: n) { (me, loggingIsEnabled) in
       if obligations.isUnsatisfiable {
         // Nothing to do if the obligations are known unsatisfiable.
         return .init()
       } else {
-        var system = ConstraintSystem(obligations, logging: isLoggingEnabled)
+        var system = ConstraintSystem(obligations, logging: loggingIsEnabled)
         return system.solution(querying: &me)
       }
     }
@@ -5526,15 +6246,13 @@ struct TypeChecker {
     !isArrow(t)
   }
 
-  /// Returns `true` iff `e` is bound to a nominal type declaration in `obligations`.
-  private mutating func isBoundToNominalTypeDecl(
-    _ e: AnyExprID, in obligations: ProofObligations
-  ) -> Bool {
-    guard
-      let c = NameExpr.ID(e),
-      let r = obligations.referredDecl[c]
-    else { return false }
-    return isBoundToNominalTypeDecl(r)
+  /// Returns `true` iff `e` is bound to a nominal type declaration in `o`.
+  private mutating func isBoundToNominalTypeDecl(_ e: AnyExprID, in o: ProofObligations) -> Bool {
+    if let r = NameExpr.ID(e).flatMap({ o.referredDecl[$0] }) {
+      return isBoundToNominalTypeDecl(r)
+    } else {
+      return false
+    }
   }
 
   /// Returns `true` iff `r` is bound to a nominal type declaration.
@@ -5568,17 +6286,21 @@ struct TypeChecker {
     program[t.decl].scope.kind == TraitDecl.self
   }
 
-  /// If `t` is the type of a mutating bundle in `scopeOfUse`, returns the output of a mutating
-  /// variant in that bundle; returns `nil` otherwise.
-  private mutating func mutatingVariantOutput(
-    of t: MethodType, in scopeOfUse: AnyScopeID
-  ) -> AnyType? {
-    guard
-      let es = TupleType(canonical(t.output, in: scopeOfUse))?.elements,
-      (es.count == 2) && (es[0].label == "self") && (es[1].label == nil),
-      areEquivalent(es[0].type, t.receiver, in: scopeOfUse)
-    else { return nil }
-    return es[1].type
+  /// Returns `true` iff `t` is a generic type parameter an associated type rooted at one.
+  private func isAbstractAssociatedDomain(_ t: AnyType) -> Bool {
+    switch t.base {
+    case let u as AssociatedTypeType:
+      return isAbstractAssociatedDomain(u.domain)
+    case let u as ConformanceLensType:
+      return isAbstractAssociatedDomain(u.subject)
+    case let u:
+      return u is GenericTypeParameterType
+    }
+  }
+
+  /// Returns `true` if `d` isn't a trait requirement, an FFI, or an external function.
+  private func requiresBody(_ d: FunctionDecl.ID) -> Bool {
+    !(program.isRequirement(d) || program[d].isForeignInterface || program[d].isExternal)
   }
 
   // MARK: Caching
@@ -5656,10 +6378,13 @@ struct TypeChecker {
     /// This map serves as cache for `extensions(of:exposedTo:)`.
     var typeToExtensions: [TypeLookupKey: [AnyDeclID]] = [:]
 
-    /// A map from trait to its refinements.
+    /// A map from trait to its bases (i.e., the traits that it refines).
     ///
-    /// This map serves as cache for `refinements(of:)`
-    var traitToRefinements: [TraitType: RefinementCluster] = [:]
+    /// This map serves as cache for `bases(of:)`
+    var traitToBases: [TraitType: RefinementClosure] = [:]
+
+    /// A map from generic declarations to their (partially formed) environment.
+    var partiallyFormedEnvironment: [AnyDeclID: GenericEnvironment] = [:]
 
     /// Creates an instance for memoizing type checking results in `local` and comminicating them
     /// to concurrent type checkers using `shared`.
@@ -5791,6 +6516,27 @@ struct TypeChecker {
 
 }
 
+/// An AST visitation callback that collects recursive references to specific declarations.
+private struct RecursiveReferenceRecognizer: ASTWalkObserver {
+
+  /// The declarations to consider while looking for cycles.
+  let targets: [AnyDeclID]
+
+  /// A map from name expression to its referred declaration.
+  let referredDecl: BindingMap
+
+  /// The recursive references that have been found.
+  var recursiveReferences: [NameExpr.ID] = []
+
+  mutating func willEnter(_ n: AnyNodeID, in ast: AST) -> Bool {
+    if let e = NameExpr.ID(n), let d = referredDecl[e]?.decl, targets.contains(d) {
+      recursiveReferences.append(e)
+    }
+    return true
+  }
+
+}
+
 extension Program {
 
   /// Returns a reference to `d` as a member of `parent`, specialized by `specialization`, exposed
@@ -5808,7 +6554,7 @@ extension Program {
         return .member(d, specialization, p.receiver!)
       } else {
         let r = innermostReceiver(in: scopeOfUse)!
-        return .member(d, specialization, .elided(.direct(AnyDeclID(r), [:])))
+        return .member(d, specialization, .elided(.direct(AnyDeclID(r), .empty)))
       }
     } else {
       return .direct(d, specialization)

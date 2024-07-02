@@ -1,4 +1,3 @@
-import Core
 import Utils
 
 /// A collection of constraints over a set of open type variables and a set of unresolved name
@@ -52,25 +51,34 @@ struct ConstraintSystem {
   private var penalties: Int = 0
 
   /// Indicates whether this instance should log a trace.
-  private let isLoggingEnabled: Bool
+  private let loggingIsEnabled: Bool
 
   /// The current indentation level for logging messages.
   private var indentation = 0
 
   /// Creates an instance for solving the constraints in `obligations`, logging a trace of the
-  /// deduction process if `isLoggingEnabled` is `true`.
-  init(_ obligations: ProofObligations, logging isLoggingEnabled: Bool) {
+  /// deduction process if `loggingIsEnabled` is `true`.
+  init(_ obligations: ProofObligations, logging loggingIsEnabled: Bool) {
     self.scope = obligations.scope
     self.bindingAssumptions = obligations.referredDecl
-    self.isLoggingEnabled = isLoggingEnabled
+    self.loggingIsEnabled = loggingIsEnabled
     _ = insert(fresh: obligations.constraints)
   }
 
   /// Creates an instance copying the state of `other`.
-  private init(copying other: inout Self) {
-    let c = other.checker.release()
-    self = other
-    other.checker = c
+  private init(copying other: Self) {
+    self.scope = other.scope
+    self.goals = other.goals
+    self.outcomes = other.outcomes
+    self.fresh = other.fresh
+    self.stale = other.stale
+    self.failureRoots = other.failureRoots
+    self.typeAssumptions = other.typeAssumptions
+    self.bindingAssumptions = other.bindingAssumptions
+    self.callOperands = other.callOperands
+    self.penalties = other.penalties
+    self.loggingIsEnabled = other.loggingIsEnabled
+    self.indentation = other.indentation
   }
 
   /// Solves this instance, using `checker` to query type relations and resolve names and returning
@@ -85,7 +93,7 @@ struct ConstraintSystem {
     notWorseThan maxScore: Solution.Score,
     querying checker: inout TypeChecker
   ) -> Solution? {
-    self.checker = checker
+    self.checker = consume checker
     defer { checker = self.checker.release() }
 
     logState()
@@ -165,10 +173,10 @@ struct ConstraintSystem {
   }
 
   /// Creates a solution from the current state.
+  ///
+  /// - Requires: There is no fresh goal to solve left.
   private mutating func formSolution() -> Solution {
-    assert(fresh.isEmpty)
     assert(outcomes.enumerated().allSatisfy({ (i, o) in (o != nil) || stale.contains(i) }))
-
     for g in stale {
       setOutcome(.failure({ (_, _, _) in () }), for: g)
     }
@@ -205,32 +213,26 @@ struct ConstraintSystem {
       return nil
     }
 
-    // Process explicit conformances.
-    if checker.conformedTraits(of: goal.model, in: scope).contains(goal.concept) {
+    // Check whether the conformance holds, either explicitly or structually.
+    if checker.conforms(goal.model, to: goal.concept, in: scope) {
       return .success
-    }
-
-    // Process structural conformances.
-    switch goal.concept {
-    case checker.program.ast.core.movable.type:
-      return solve(structuralConformance: goal)
-    case checker.program.ast.core.deinitializable.type:
-      return solve(structuralConformance: goal)
-    default:
+    } else {
       return .failure(failureToSolve(goal))
     }
   }
 
-  /// Knowing types can conform to `goal.concept` structurally, if `goal.model` is a structural
-  /// type, creates and returns sub-goals checking that its parts conform to `goal.concept`; returns
-  /// `.failure` otherwise.
+  /// If `goal.model` is a structural type, creates and returns sub-goals checking that its parts
+  /// conform to `goal.concept`; returns `.failure` otherwise.
   ///
-  /// - Requires: `goal.model` is not a type variable.
+  /// - Requires: `goal.concept` is a trait supporting structural conformances and `goal.model` is
+  ///   not a type variable.
   private mutating func solve(structuralConformance goal: ConformanceConstraint) -> Outcome {
     let model = checker.canonical(goal.model, in: scope)
     assert(!(model.base is TypeVariable))
 
     switch model.base {
+    case let t as ArrowType:
+      return delegate(structuralConformance: goal, for: [t.environment])
     case let t as TupleType:
       return delegate(structuralConformance: goal, for: t.elements.lazy.map(\.type))
     case let t as UnionType:
@@ -316,7 +318,7 @@ struct ConstraintSystem {
     case (_, let r as TypeAliasType):
       return simplify(goal, as: goal.left, isSubtypeOf: r.resolved)
 
-    case (let l as LambdaType, let r as LambdaType):
+    case (let l as ArrowType, let r as ArrowType):
       return solve(subtyping: g, between: l, and: r)
 
     case (let l as UnionType, let r as UnionType):
@@ -346,7 +348,7 @@ struct ConstraintSystem {
           candidates.append(.init(constraints: [c], penalties: 1))
         }
       } else {
-        for subset in r.elements.combinations(of: r.elements.count - 1) {
+        for subset in r.elements.combinations(ofCount: r.elements.count - 1) {
           let c = SubtypingConstraint(goal.left, ^UnionType(subset), origin: o)
           candidates.append(.init(constraints: [c], penalties: 1))
         }
@@ -452,9 +454,9 @@ struct ConstraintSystem {
     }
   }
 
-  /// Implements of `solve(subtyping:)` for two `LambdaType`s.
+  /// Implements of `solve(subtyping:)` for two `ArrowType`s.
   private mutating func solve(
-    subtyping g: GoalIdentity, between l: LambdaType, and r: LambdaType
+    subtyping g: GoalIdentity, between l: ArrowType, and r: ArrowType
   ) -> Outcome? {
     let goal = goals[g] as! SubtypingConstraint
 
@@ -557,7 +559,7 @@ struct ConstraintSystem {
   private mutating func solve(
     autoclosureParameter goal: ParameterConstraint, ofType p: ParameterType
   ) -> Outcome? {
-    let t = LambdaType(p.bareType)!
+    let t = ArrowType(p.bareType)!
     let s = schedule(
       ParameterConstraint(
         goal.left, AnyType(ParameterType(.`let`, t.output)), origin: goal.origin.subordinate()))
@@ -691,8 +693,11 @@ struct ConstraintSystem {
     for c in argumentMatching.constraints {
       subordinates.append(schedule(c))
     }
+
+    // If the callee has a method type, its return type depends on whether it is used mutably.
+    let o = callee.outputOfUse(mutable: goal.isMutating)
     subordinates.append(
-      schedule(EqualityConstraint(callee.output, goal.output, origin: goal.origin.subordinate())))
+      schedule(EqualityConstraint(o, goal.output, origin: goal.origin.subordinate())))
 
     return delegate(to: subordinates)
   }
@@ -845,7 +850,7 @@ struct ConstraintSystem {
       defer { indentation -= 1 }
 
       // Explore the result of this choice.
-      var exploration = Self(copying: &self)
+      var exploration = Self(copying: self)
       let s = configureSubSystem(&exploration, choice)
       exploration.setOutcome(s.isEmpty ? .success : delegate(to: s), for: g)
       guard let new = exploration.solution(notWorseThan: results.score, querying: &checker) else {
@@ -885,9 +890,9 @@ struct ConstraintSystem {
     goals.append(g)
     outcomes.append(nil)
 
-    let i = fresh.partitioningIndex(
-      at: newIdentity,
-      orderedBy: { (a, b) in !goals[a].isSimpler(than: goals[b]) })
+    // fresh is sorted in order of increasing simplicity.
+    let newIdentityGoal = goals[newIdentity]
+    let i = fresh.partitioningIndex(where: { goals[$0].isSimpler(than: newIdentityGoal) })
     fresh.insert(newIdentity, at: i)
     return newIdentity
   }
@@ -916,27 +921,44 @@ struct ConstraintSystem {
     }
   }
 
-  /// Returns `true` iff `lhs` and `rhs`, which have different constructors, can be unified.
+  /// Returns `true` iff `lhs` and `rhs` can be unified.
   private mutating func unifySyntacticallyInequal(_ lhs: AnyType, _ rhs: AnyType) -> Bool {
     let t = typeAssumptions[lhs]
     let u = typeAssumptions[rhs]
 
-    if let v = TypeVariable(t) {
-      assume(v, equals: u)
+    switch (t.base, u.base) {
+    case (let l as TypeVariable, _):
+      assume(l, equals: u)
       return true
-    }
-    if let v = TypeVariable(u) {
-      assume(v, equals: t)
-      return true
-    }
-    if !t[.isCanonical] {
-      return unify(checker.canonical(t, in: scope), u)
-    }
-    if !u[.isCanonical] {
-      return unify(t, checker.canonical(u, in: scope))
-    }
 
-    return t == u
+    case (_, let r as TypeVariable):
+      assume(r, equals: t)
+      return true
+
+    case (let l as UnionType, let r as UnionType):
+      return unifySyntacticallyInequal(l, r)
+
+    case _ where !t[.isCanonical] || !u[.isCanonical]:
+      return unify(checker.canonical(t, in: scope), checker.canonical(u, in: scope))
+
+    default:
+      // TODO: Use semantic equality
+      return t == u
+    }
+  }
+
+  /// Returns `true` iff `lhs` and `rhs` can be unified.
+  private mutating func unifySyntacticallyInequal(
+    _ lhs: UnionType, _ rhs: UnionType
+  ) -> Bool {
+    for a in lhs.elements {
+      var success = false
+      for b in rhs.elements where unify(a, b) {
+        success = true
+      }
+      if !success { return false }
+    }
+    return true
   }
 
   /// Extends the type substution table to map `tau` to `substitute`.
@@ -960,13 +982,13 @@ struct ConstraintSystem {
     }
   }
 
-  /// Logs a line of text in the standard output if `self.isLoggingEnabled` is `true`.
+  /// Logs a line of text in the standard output if `self.loggingIsEnabled` is `true`.
   private func log(_ line: @autoclosure () -> String) {
-    if !isLoggingEnabled { return }
+    if !loggingIsEnabled { return }
     print(String(repeating: "  ", count: indentation) + line())
   }
 
-  /// Logs `outcome` in the standard output if `self.isLoggingEnabled` is `true`.
+  /// Logs `outcome` in the standard output if `self.loggingIsEnabled` is `true`.
   private func log(outcome: Outcome?) {
     switch outcome {
     case nil:
@@ -980,9 +1002,9 @@ struct ConstraintSystem {
     }
   }
 
-  /// Logs `self`'s current state in the standard output if `self.isLoggingEnabled` is `true`.
+  /// Logs `self`'s current state in the standard output if `self.loggingIsEnabled` is `true`.
   private func logState() {
-    if !isLoggingEnabled { return }
+    if !loggingIsEnabled { return }
     log("fresh:")
     for g in fresh {
       log("- \"\(goals[g])\"")

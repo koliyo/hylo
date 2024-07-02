@@ -2,9 +2,9 @@
 public type PointerToMutable<Pointee>: Regular {
 
   /// The raw bits of the address.
-  var base: Builtin.ptr
+  internal var base: Builtin.ptr
 
-  memberwise init
+  internal memberwise init
 
   /// The value at the address represented by `self`.
   ///
@@ -55,7 +55,22 @@ public type PointerToMutable<Pointee>: Regular {
   /// - Requires: the `MemoryLayout<Pointee>.size()` bytes starting at the address are uninitialized
   ///   and suitably aligned for `Pointee`.
   public fun unsafe_initialize_pointee<E, R>(_ initialize: inout [E](set Pointee) -> R) -> R {
-    initialize(base as* (remote set Pointee))
+    initialize(&(base as* (remote set Pointee)))
+  }
+
+  /// Initializes the memory referenced by `count` consecutive bytewise copies of `value`.
+  public fun unsafe_initialize(copying_bytes_from source: Pointer<Pointee>, count: Int) {
+    var i = 0
+    var s = Pointer<Int8>(type_punning: source)
+    var d = PointerToMutable<Int8>(type_punning: self)
+
+    let byte_count = MemoryLayout<Pointee>.stride() * count
+    while i < byte_count {
+      d.unsafe_initialize_pointee(s.unsafe[].copy())
+      &s = s.advance(by: 1)
+      &d = d.advance(by: 1)
+      &i += 1
+    }
   }
 
 }
@@ -86,6 +101,20 @@ public conformance PointerToMutable: Equatable {
 
 }
 
+public conformance PointerToMutable: ForeignConvertible {
+
+  public typealias ForeignRepresentation = Builtin.ptr
+
+  public init(foreign_value: sink Builtin.ptr) {
+    &self.base = foreign_value
+  }
+
+  public fun foreign_value() -> Builtin.ptr {
+    base
+  }
+
+}
+
 public extension PointerToMutable where Pointee: Movable {
 
   /// Returns the value at the address represented by `self`, leaving the storage at this address
@@ -93,15 +122,28 @@ public extension PointerToMutable where Pointee: Movable {
   ///
   /// Note: This method should be deprecated once nonmutating subscripts are implemented.
   public fun unsafe_pointee() -> Pointee {
-    return base as* (remote sink Pointee)
+    base as* (remote sink Pointee)
   }
 
-  /// Initialize the value at the address represented by `self` to `value`.
+  /// Initializes the value at the address represented by `self` to `value`.
   ///
   /// - Requires: the `MemoryLayout<Pointee>.size()` bytes starting at the address are uninitialized
   ///   and suitably aligned for `Pointee`.
   public fun unsafe_initialize_pointee(_ value: sink Pointee) {
     initialize<Pointee>(&(base as* (remote set Pointee)), to: value)
+  }
+
+}
+
+public extension PointerToMutable where Pointee: Copyable {
+
+  /// Initializes the memory referenced by `self` with `count` consecutive copies of `value`.
+  public fun unsafe_initialize(repeating value: Pointee, count: Int) {
+    var i = 0
+    while i < count {
+      self.advance(by: i).unsafe_initialize_pointee(value.copy())
+      &i += 1
+    }
   }
 
 }

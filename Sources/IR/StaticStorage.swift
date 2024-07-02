@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 
 /// The address of some statically allocated storage.
 public struct StaticStorage {
@@ -17,6 +17,7 @@ public struct StaticStorage {
   public init(
     _ t: AnyType, identifiedBy id: AnyDeclID, initializedWith initializer: Function.ID
   ) {
+    precondition(t[.isCanonical])
     self.id = id
     self.pointee = t
     self.initializer = initializer

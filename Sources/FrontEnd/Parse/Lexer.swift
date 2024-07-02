@@ -1,5 +1,3 @@
-import Core
-
 /// A type that tokenize a source file.
 public struct Lexer: IteratorProtocol, Sequence {
 
@@ -106,10 +104,10 @@ public struct Lexer: IteratorProtocol, Sequence {
       case "infix": token.kind = .`infix`
       case "init": token.kind = .`init`
       case "inout": token.kind = .`inout`
+      case "internal": token.kind = .`internal`
       case "let": token.kind = .`let`
       case "match": token.kind = .`match`
       case "namespace": token.kind = .`namespace`
-      case "nil": token.kind = .`nil`
       case "operator": token.kind = .`operator`
       case "postfix": token.kind = .`postfix`
       case "prefix": token.kind = .`prefix`
@@ -160,7 +158,7 @@ public struct Lexer: IteratorProtocol, Sequence {
         _ = take(while: { $0.isLetter || $0.isDecDigit })
 
         if peek() == "`" {
-          let start = sourceCode.position(sourceCode.text.index(after: token.site.start))
+          let start = sourceCode.position(sourceCode.text.index(after: token.site.startIndex))
           token.kind = .name
           token.site = start ..< location
           discard()
@@ -244,7 +242,7 @@ public struct Lexer: IteratorProtocol, Sequence {
       case "<", ">":
         // Leading angle brackets are tokenized individually, to parse generic clauses.
         discard()
-        oper = sourceCode.text[token.site.start ..< index]
+        oper = sourceCode.text[token.site.startIndex ..< index]
 
       default:
         oper = take(while: { $0.isOperator })

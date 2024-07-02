@@ -1,5 +1,3 @@
-import Core
-
 extension Diagnostic {
 
   static func error(assignOperatorRequiresWhitespaces token: Token) -> Diagnostic {
@@ -42,12 +40,12 @@ extension Diagnostic {
     .error("unexpected token '\(token.kind)'", at: token.site)
   }
 
-  static func error(unterminatedCommentEndingAt endLocation: SourcePosition) -> Diagnostic {
-    .error("unterminated comment", at: endLocation ..< endLocation)
+  static func error(unterminatedCommentStartingAt p: SourcePosition) -> Diagnostic {
+    .error("unterminated comment", at: p ..< p)
   }
 
-  static func error(unterminatedStringEndingAt endLocation: SourcePosition) -> Diagnostic {
-    .error("unterminated string", at: endLocation ..< endLocation)
+  static func error(unterminatedStringStartingAt p: SourcePosition) -> Diagnostic {
+    .error("unterminated string", at: p ..< p)
   }
 
   static func error(duplicateAccessModifier m: SourceRepresentable<AccessModifier>) -> Diagnostic {
@@ -79,7 +77,7 @@ extension Diagnostic {
     memberModifier member: SourceRepresentable<MemberModifier>,
     appearsBeforeAccessModifier access: SourceRepresentable<AccessModifier>
   ) -> Diagnostic {
-    return .error(
+    .error(
       "member modifier '\(member.value)' must appear after access modifier '\(access.value)'",
       at: member.site)
   }
@@ -110,14 +108,14 @@ extension Diagnostic {
     .error("unknown pragma '\(n)'", at: site)
   }
 
-  static func error(attributeTakesNoArgument a: SourceRepresentable<Attribute>) -> Diagnostic {
-    .error("attribute '\(a.value.name.value)' takes no argument", at: a.site)
-  }
-
   static func error(
     illegalAccessModifierForImplicitParameter e: SourceRepresentable<AccessEffect>
   ) -> Diagnostic {
     .error("'\(e.value)'-parameter cannot be implicit", at: e.site)
+  }
+
+  static func error(declarationRequiresDefinitionAt site: SourceRange) -> Diagnostic {
+    .error("declaration requires definition", at: site)
   }
 
 }

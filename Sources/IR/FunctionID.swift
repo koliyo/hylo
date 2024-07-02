@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 import Utils
 
 extension Function {
@@ -53,6 +53,15 @@ extension Function {
     public init(monomorphized base: Function.ID, for arguments: GenericArguments) {
       precondition(!arguments.isEmpty)
       self.value = .monomorphized(base: base, arguments: arguments)
+    }
+
+    /// `true` if `self` is the identity of a synthesized function.
+    public var isSynthesized: Bool {
+      if case .synthesized = value {
+        return true
+      } else {
+        return false
+      }
     }
 
     /// `true` if `self` is the identity of a monomorphized function.

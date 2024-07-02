@@ -1,4 +1,3 @@
-import Core
 import FrontEnd
 import Utils
 
@@ -43,7 +42,7 @@ struct Mangler {
     self.program = program
     self.scopeOfUse = scopeOfUse
 
-    if program.ast.isCoreModuleLoaded {
+    if program.ast.coreModuleIsLoaded {
       self.reserved[.node(AnyNodeID(program.ast.coreLibrary!))] = .hylo
       register(coreType: "Bool", as: .bool)
       register(coreType: "Int", as: .int)
@@ -307,7 +306,7 @@ struct Mangler {
     case .value:
       UNIMPLEMENTED()
 
-    case .conformance(let lhs, let rhs):
+    case .bound(let lhs, let rhs):
       write(operator: .conformanceConstraint, to: &output)
       mangle(type: program[lhs].type, to: &output)
       write(integer: rhs.count, to: &output)
@@ -342,9 +341,14 @@ struct Mangler {
   ) {
     write(operator: .monomorphizedFunctionDecl, to: &output)
     mangle(function: symbol, to: &output)
-    write(integer: arguments.count, to: &output)
-    for u in arguments.values {
-      mangle(value: u, to: &output)
+    write(specialization: arguments, to: &output)
+  }
+
+  /// Writes the mangled representation of `specialization` to `output`.
+  private mutating func write(specialization: GenericArguments, to output: inout Output) {
+    write(integer: specialization.count, to: &output)
+    for (_, v) in specialization.sorted(by: \.key.rawValue) {
+      mangle(value: v, to: &output)
     }
   }
 
@@ -388,13 +392,10 @@ struct Mangler {
   /// Writes the mangled representation of `r` to `output`.
   mutating func mangle(reference r: DeclReference, to output: inout Output) {
     switch r {
-    case .direct(let d, let parameterization):
+    case .direct(let d, let z):
       write(operator: .directDeclReference, to: &output)
       mangle(decl: d, to: &output)
-      write(integer: parameterization.count, to: &output)
-      for u in parameterization.values {
-        mangle(value: u, to: &output)
-      }
+      write(specialization: z, to: &output)
 
     default:
       UNIMPLEMENTED()
@@ -448,8 +449,8 @@ struct Mangler {
       write(operator: .genericTypeParameterType, to: &output)
       mangle(decl: AnyDeclID(t.decl), to: &output)
 
-    case let t as LambdaType:
-      write(lambda: t, to: &output)
+    case let t as ArrowType:
+      write(arrow: t, to: &output)
 
     case let t as MethodType:
       write(method: t, to: &output)
@@ -571,8 +572,8 @@ struct Mangler {
   }
 
   /// Writes the mangled representation of `symbol` to `output`.
-  private mutating func write(lambda t: LambdaType, to output: inout Output) {
-    write(operator: .lambdaType, to: &output)
+  private mutating func write(arrow t: ArrowType, to output: inout Output) {
+    write(operator: .arrowType, to: &output)
     mangle(type: t.environment, to: &output)
 
     write(integer: t.inputs.count, to: &output)

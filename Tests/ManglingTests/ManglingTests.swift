@@ -1,4 +1,3 @@
-import Core
 import FrontEnd
 import IR
 import StandardLibrary
@@ -13,7 +12,7 @@ final class ManglingTests: XCTestCase {
       import Hylo
 
       namespace Stash {
-        type A {}
+        public type A {}
 
         trait Indexable {
           value size

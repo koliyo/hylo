@@ -1,9 +1,9 @@
 /// A 8-bit signed integer value.
 public type Int8 {
 
-  var value: Builtin.i8
+  internal var value: Builtin.i8
 
-  memberwise init
+  internal memberwise init
 
   /// Creates an instance with the same memory representation as `other`.
   public init(bit_pattern other: UInt8) {
@@ -249,6 +249,14 @@ public conformance Int8: BinaryInteger {
 
 }
 
+public conformance Int8: SignedInteger {
+
+  public fun successor() -> Self {
+    self + 1
+  }
+
+}
+
 public conformance Int8: FixedWidthInteger {
 
   public fun matches(_ mask: Self) -> Bool {
@@ -334,6 +342,20 @@ public conformance Int8: FixedWidthInteger {
 
   public static fun min() -> Self {
     -128
+  }
+
+}
+
+public conformance Int8: Strideable {
+
+  public typealias Stride = Int8
+
+  public fun offset(to other: Self) -> Int8 {
+    other - self
+  }
+
+  public fun advance(by offset: Int8) -> Self {
+    self + offset
   }
 
 }

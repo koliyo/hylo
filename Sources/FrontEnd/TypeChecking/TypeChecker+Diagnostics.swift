@@ -1,4 +1,3 @@
-import Core
 
 extension Diagnostic {
 
@@ -6,10 +5,11 @@ extension Diagnostic {
     .error("ambiguous disjunction", at: site)
   }
 
-  static func error(autoclosureExpectsEmptyLambdaAt site: SourceRange, given: AnyType) -> Diagnostic
+  static func error(autoclosureExpectsEmptyEnvironment site: SourceRange, given: AnyType)
+    -> Diagnostic
   {
     .error(
-      "autoclosure parameter expects lambda type with no parameters (given type: \(given))",
+      "autoclosure parameter expects arrow type with no parameters (given type: \(given))",
       at: site)
   }
 
@@ -94,12 +94,6 @@ extension Diagnostic {
     .error("incompatible types '\(l)' and '\(r)'", at: site)
   }
 
-  static func error(invalidUseOfAssociatedType name: String, at site: SourceRange) -> Diagnostic {
-    .error(
-      "associated type '\(name)' can only be used with a concrete type or generic type parameter",
-      at: site)
-  }
-
   static func error(invalidDestructuringOfType type: AnyType, at site: SourceRange) -> Diagnostic {
     .error("invalid destructuring of type '\(type)'", at: site)
   }
@@ -134,7 +128,7 @@ extension Diagnostic {
   }
 
   static func error(invalidExistentialInterface e: NameExpr.ID, in ast: AST) -> Diagnostic {
-    return .error("'\(ast[e].name.value)' is not a valid existential interface", at: ast[e].site)
+    .error("'\(ast[e].name.value)' is not a valid existential interface", at: ast[e].site)
   }
 
   static func error(
@@ -192,7 +186,13 @@ extension Diagnostic {
   static func note(
     trait x: TraitType, requiresAssociatedType n: String, at site: SourceRange
   ) -> Diagnostic {
-    return .note("trait '\(x)' requires associaed type '\(n)'", at: site)
+    .note("trait '\(x)' requires associated type '\(n)'", at: site)
+  }
+
+  static func note(implementationMustBePublic d: AnyDeclID, in ast: AST) -> Diagnostic {
+    .note(
+      "implementation of trait requirement must be public",
+      at: ast.siteForDiagnostics(about: d))
   }
 
   static func error(undefinedOperator name: String, at site: SourceRange) -> Diagnostic {
@@ -314,17 +314,13 @@ extension Diagnostic {
   static func error(
     ambiguousUse expr: NameExpr.ID, in ast: AST, candidates: [AnyDeclID] = []
   ) -> Diagnostic {
-    return .error(
+    .error(
       "ambiguous use of '\(ast[expr].name.value)'", at: ast[expr].site,
       notes: candidates.map { .note("candidate here", at: ast[$0].site) })
   }
 
   static func error(cannotExtend t: AnyType, at site: SourceRange) -> Diagnostic {
     .error("cannot extend type '\(t)'", at: site)
-  }
-
-  static func error(mutatingBundleMustReturnTupleAt site: SourceRange) -> Diagnostic {
-    .error("mutating bundle must return '{self: Self, _}'", at: site)
   }
 
   static func error(
@@ -361,6 +357,52 @@ extension Diagnostic {
       return .error(
         "non-consuming for loop requires '\(m)' to conform to 'Collection' or 'Iterator'", at: site)
     }
+  }
+
+  static func error(
+    referenceTo d: SourceRepresentable<Name>, requires t: AnyType, conformsTo u: TraitType,
+    dueToConstraintAt constraintSite: SourceRange
+  ) -> Diagnostic {
+    .error(
+      "reference to '\(d.value)' requires that '\(t)' be conforming to '\(u)'",
+      at: d.site,
+      notes: [.note("constraint declared here", at: constraintSite)])
+  }
+
+  static func error(
+    referenceTo d: SourceRepresentable<Name>, requires t: AnyType, equals u: AnyType,
+    dueToConstraintAt constraintSite: SourceRange
+  ) -> Diagnostic {
+    .error(
+      "reference to '\(d.value)' requires that '\(t)' be equal to '\(u)'",
+      at: d.site,
+      notes: [.note("constraint declared here", at: constraintSite)])
+  }
+
+  static func error(
+    invalidReferenceToAssociatedType a: AssociatedTypeDecl.ID, at site: SourceRange, in ast: AST
+  ) -> Diagnostic {
+    .error(
+      """
+      associated type '\(ast[a].baseName)' can only be referred to with a concrete type or \
+      generic parameter base
+      """, at: site)
+  }
+
+  static func error(
+    invalidReferenceToInaccessible ds: [AnyDeclID], named n: SourceRepresentable<Name>, in ast: AST
+  ) -> Diagnostic {
+    .error(
+      "'\(n.value)' is inaccessible due to its protection level", at: n.site,
+      notes: ds.map { (d) in .note("'\(n.value)' declared here", at: ast[d].site) })
+  }
+
+  static func error(recursiveDefinition d: AnyDeclID, in ast: AST) -> Diagnostic {
+    .error("definition recursively depends on itself", at: ast.siteForDiagnostics(about: d))
+  }
+
+  static func error(referenceToSibling e: NameExpr.ID, in ast: AST) -> Diagnostic {
+    .error("default value cannot refer to a sibling capture or parameter", at: ast[e].site)
   }
 
   static func warning(needlessImport d: ImportDecl.ID, in ast: AST) -> Diagnostic {

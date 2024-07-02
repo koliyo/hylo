@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 import Utils
 
 /// A Hylo IR reference to a user function.
@@ -20,12 +20,12 @@ public struct FunctionReference: Constant, Hashable {
     precondition(module[f].genericParameters.isEmpty, "underspecialized function reference")
 
     let v = module[f]
-    let t = LambdaType(inputs: v.inputs.map({ .init(type: ^$0.type) }), output: v.output)
+    let t = ArrowType(inputs: v.inputs.map({ .init(type: ^$0.type) }), output: v.output)
     assert(t[.isCanonical])
 
     self.function = f
     self.type = .address(t)
-    self.specialization = [:]
+    self.specialization = .empty
   }
 
   /// Creates a reference to `f`, which is in `module`, specialized by `specialization` in
@@ -43,7 +43,7 @@ public struct FunctionReference: Constant, Hashable {
     }
 
     let v = module[f]
-    let t = LambdaType(inputs: v.inputs.map({ .init(type: ^$0.type) }), output: v.output)
+    let t = ArrowType(inputs: v.inputs.map({ .init(type: ^$0.type) }), output: v.output)
     let u = module.program.canonical(
       module.program.specialize(^t, for: a, in: scopeOfUse), in: scopeOfUse)
 

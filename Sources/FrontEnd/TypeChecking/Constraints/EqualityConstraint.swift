@@ -1,4 +1,3 @@
-import Core
 import Utils
 
 /// A constraint `L == R` specifying that `L` is exactly the same type as `R`.
@@ -17,13 +16,6 @@ struct EqualityConstraint: Constraint, Hashable {
     self.left = left
     self.right = right
     self.origin = origin
-  }
-
-  /// Creates an instance transforming by `constraint`.
-  init(_ constraint: SubtypingConstraint) {
-    self.left = constraint.left
-    self.right = constraint.right
-    self.origin = constraint.origin
   }
 
   /// Inserts the type variables that occur free in `self` into `s`.

@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 import Utils
 
 /// A one or two letter identifier specifying how to interpret mangled data.
@@ -86,7 +86,7 @@ public enum ManglingOperator: String {
 
   case methodType = "hT"
 
-  case lambdaType = "lT"
+  case arrowType = "lT"
 
   case metatypeType = "mT"
 

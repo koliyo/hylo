@@ -1,14 +1,30 @@
 import ArgumentParser
 import CodeGenLLVM
-import Core
 import Foundation
 import FrontEnd
 import IR
-import LLVM
+import SwiftyLLVM
 import StandardLibrary
 import Utils
 
 public struct Driver: ParsableCommand {
+
+  /// A validation error that includes the command's full help message.
+  struct ValidationErrorWithHelp: Error, CustomStringConvertible {
+    var message: String
+
+    init(_ message: String) {
+      self.message = message
+    }
+
+    var description: String {
+      """
+      \(message)
+
+      \(Driver.helpMessage())
+      """
+    }
+  }
 
   /// The type of the output files to generate.
   private enum OutputType: String, ExpressibleByArgument {
@@ -52,9 +68,9 @@ public struct Driver: ParsableCommand {
   private var freestanding: Bool = false
 
   @Flag(
-    name: [.customLong("sequential")],
-    help: "Execute the compilation pipeline sequentially.")
-  private var compileSequentially: Bool = false
+    name: [.customLong("experimental-parallel-typechecking")],
+    help: "Parallelize the type checker")
+  private var experimentalParallelTypeChecking: Bool = false
 
   @Flag(
     name: [.customLong("typecheck")],
@@ -92,7 +108,7 @@ public struct Driver: ParsableCommand {
   @Option(
     name: [.customShort("l")],
     help: ArgumentHelp(
-      "Link the generated crate(s) to the specified native library.",
+      "Link the generated module(s) to the specified native library.",
       valueName: "name"))
   private var libraries: [String] = []
 
@@ -108,13 +124,18 @@ public struct Driver: ParsableCommand {
   private var verbose: Bool = false
 
   @Flag(
+    name: [.customShort("V"), .long],
+    help: "Output the compiler version.")
+  private var version: Bool = false
+
+  @Flag(
     name: [.customShort("O")],
     help: "Compile with optimizations.")
   private var optimize: Bool = false
 
   @Argument(
     transform: URL.init(fileURLWithPath:))
-  private var inputs: [URL]
+  private var inputs: [URL] = []
 
   public init() {}
 
@@ -144,6 +165,7 @@ public struct Driver: ParsableCommand {
       try executeCommand(diagnostics: &diagnostics)
     } catch let d as DiagnosticSet {
       assert(d.containsError, "Diagnostics containing no errors were thrown")
+      diagnostics.formUnion(d)
       return (ExitCode.failure, diagnostics)
     }
     return (ExitCode.success, diagnostics)
@@ -151,6 +173,15 @@ public struct Driver: ParsableCommand {
 
   /// Executes the command, accumulating diagnostics in `diagnostics`.
   private func executeCommand(diagnostics: inout DiagnosticSet) throws {
+
+    if version {
+      standardError.write("\(hcVersion)\n")
+      return
+    }
+
+    guard !inputs.isEmpty else {
+      throw ValidationErrorWithHelp("Missing expected argument '<inputs> ...'")
+    }
 
     if compileInputAsModules {
       fatalError("compilation as modules not yet implemented.")
@@ -172,7 +203,7 @@ public struct Driver: ParsableCommand {
     }
 
     let program = try TypedProgram(
-      annotating: ScopedProgram(ast), inParallel: !compileSequentially,
+      annotating: ScopedProgram(ast), inParallel: experimentalParallelTypeChecking,
       reportingDiagnosticsTo: &diagnostics,
       tracingInferenceIf: shouldTraceInference)
     if typeCheckOnly { return }
@@ -189,44 +220,31 @@ public struct Driver: ParsableCommand {
 
     // LLVM
 
-    if verbose {
-      standardError.write("begin depolymorphization pass.\n")
-    }
-    ir.applyPass(.depolymorphize)
+    logVerbose("begin depolymorphization pass.\n")
+    ir.depolymorphize()
 
-    if verbose {
-      standardError.write("create LLVM target machine.\n")
-    }
+    logVerbose("create LLVM target machine.\n")
     #if os(Windows)
-      let target = try LLVM.TargetMachine(for: .host())
+      let target = try SwiftyLLVM.TargetMachine(for: .host())
     #else
-      let target = try LLVM.TargetMachine(for: .host(), relocation: .pic)
+      let target = try SwiftyLLVM.TargetMachine(for: .host(), relocation: .pic)
     #endif
-    if verbose {
-      standardError.write("create LLVM program.\n")
-    }
+
+    logVerbose("create LLVM program.\n")
     var llvmProgram = try LLVMProgram(ir, mainModule: sourceModule, for: target)
 
+    logVerbose("LLVM mandatory passes.\n")
+    llvmProgram.applyMandatoryPasses()
+
     if optimize {
-      if verbose {
-        standardError.write("LLVM optimization.\n")
-      }
+      logVerbose("LLVM optimization.\n")
       llvmProgram.optimize()
-    } else {
-      if verbose {
-        standardError.write("LLVM mandatory passes.\n")
-      }
-      llvmProgram.applyMandatoryPasses()
     }
 
-    if verbose {
-      standardError.write("LLVM processing complete.\n")
-    }
+    logVerbose("LLVM processing complete.\n")
     if outputType == .llvm {
       let m = llvmProgram.llvmModules[sourceModule]!
-      if verbose {
-        standardError.write("writing LLVM output.")
-      }
+      logVerbose("writing LLVM output.")
       try m.description.write(to: llvmFile(productName), atomically: true, encoding: .utf8)
       return
     }
@@ -261,10 +279,15 @@ public struct Driver: ParsableCommand {
     #endif
   }
 
+  /// Logs `m` to the standard error iff `verbose` is `true`.
+  private func logVerbose(_ m: @autoclosure () -> String) {
+    if verbose { standardError.write(m()) }
+  }
+
   /// Returns `true` if type inference related to `n`, which is in `p`, would be traced.
   private func shouldTraceInference(_ n: AnyNodeID, _ p: TypedProgram) -> Bool {
     if let s = inferenceTracingSite {
-      return s.bounds.contains(p[n].site.first())
+      return s.bounds.contains(p[n].site.start)
     } else {
       return false
     }
@@ -381,9 +404,7 @@ public struct Driver: ParsableCommand {
 
   /// Writes `source` to `url`, possibly with verbose logging.
   private func write(_ source: String, toURL url: URL) throws {
-    if verbose {
-      standardError.write("Writing \(url)")
-    }
+    logVerbose("Writing \(url)")
     try source.write(to: url, atomically: true, encoding: .utf8)
   }
 
@@ -424,12 +445,8 @@ public struct Driver: ParsableCommand {
     _ arguments: [String] = [],
     diagnostics: inout DiagnosticSet
   ) throws -> String? {
-    if verbose {
-      standardError.write(([programPath] + arguments).joined(separator: " "))
-    }
-
+    logVerbose(([programPath] + arguments).joined(separator: " "))
     let r = try Process.run(URL(fileURLWithPath: programPath), arguments: arguments)
-
     return r.standardOutput[].trimmingCharacters(in: .whitespacesAndNewlines)
   }
 

@@ -1,4 +1,4 @@
-import Core
+import FrontEnd
 import XCTest
 
 extension XCTestCase {
@@ -39,7 +39,7 @@ extension XCTIssue {
       type: .assertionFailure,
       compactDescription: d.message,
       sourceCodeContext:
-        .init(location: XCTSourceCodeLocation.init(d.site.first())))
+        .init(location: XCTSourceCodeLocation.init(d.site.start)))
   }
 
 }
