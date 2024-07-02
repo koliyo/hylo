@@ -1,8 +1,8 @@
-import LLVM
-import Core
+import SwiftyLLVM
+import FrontEnd
 
-extension LLVM.IntegerPredicate {
-  public init(_ p: Core.IntegerPredicate) {
-    self = LLVM.IntegerPredicate(rawValue: p.rawValue)!
+extension SwiftyLLVM.IntegerPredicate {
+  public init(_ p: FrontEnd.IntegerPredicate) {
+    self = SwiftyLLVM.IntegerPredicate(rawValue: p.rawValue)!
   }
 }

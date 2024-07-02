@@ -1,8 +1,8 @@
-import LLVM
-import Core
+import SwiftyLLVM
+import FrontEnd
 
-extension LLVM.OverflowBehavior {
-  public init(_ ob: Core.OverflowBehavior) {
+extension SwiftyLLVM.OverflowBehavior {
+  public init(_ ob: FrontEnd.OverflowBehavior) {
     switch ob {
       case .ignore: self = OverflowBehavior.ignore
       case .nuw: self = OverflowBehavior.nuw

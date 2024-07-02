@@ -1,8 +1,3 @@
-<<<<<<< HEAD:Sources/Core/NativeInstruction.swift
-=======
-import SwiftyLLVM
-
->>>>>>> upstream/main:Sources/FrontEnd/NativeInstruction.swift
 /// The name of an native instruction mapped to a built-in function.
 ///
 /// Native instructions implement basis operations on built-in types, such as `Builtin.i64`, with
@@ -30,7 +25,6 @@ import SwiftyLLVM
 /// integral and floating-point numbers as well as conversions from and to these types.
 public enum NativeInstruction: Hashable {
 
-<<<<<<< HEAD:Sources/Core/NativeInstruction.swift
   case add(OverflowBehavior, BuiltinType)
 
   case sub(OverflowBehavior, BuiltinType)
@@ -38,15 +32,6 @@ public enum NativeInstruction: Hashable {
   case mul(OverflowBehavior, BuiltinType)
 
   case shl(OverflowBehavior, BuiltinType)
-=======
-  case add(SwiftyLLVM.OverflowBehavior, BuiltinType)
-
-  case sub(SwiftyLLVM.OverflowBehavior, BuiltinType)
-
-  case mul(SwiftyLLVM.OverflowBehavior, BuiltinType)
-
-  case shl(SwiftyLLVM.OverflowBehavior, BuiltinType)
->>>>>>> upstream/main:Sources/FrontEnd/NativeInstruction.swift
 
   case udiv(exact: Bool, BuiltinType)
 
@@ -84,11 +69,7 @@ public enum NativeInstruction: Hashable {
   // Corresponding LLVM instruction: umul.with.overflow
   case unsignedMultiplicationWithOverflow(BuiltinType)
 
-<<<<<<< HEAD:Sources/Core/NativeInstruction.swift
   case icmp(IntegerPredicate, BuiltinType)
-=======
-  case icmp(SwiftyLLVM.IntegerPredicate, BuiltinType)
->>>>>>> upstream/main:Sources/FrontEnd/NativeInstruction.swift
 
   case trunc(BuiltinType, BuiltinType)
 
@@ -114,11 +95,7 @@ public enum NativeInstruction: Hashable {
 
   case frem(MathFlags, BuiltinType)
 
-<<<<<<< HEAD:Sources/Core/NativeInstruction.swift
   case fcmp(MathFlags, FloatingPointPredicate, BuiltinType)
-=======
-  case fcmp(MathFlags, SwiftyLLVM.FloatingPointPredicate, BuiltinType)
->>>>>>> upstream/main:Sources/FrontEnd/NativeInstruction.swift
 
   case fptrunc(BuiltinType, BuiltinType)
 

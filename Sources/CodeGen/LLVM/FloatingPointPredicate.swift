@@ -1,8 +1,8 @@
-import LLVM
-import Core
+import SwiftyLLVM
+import FrontEnd
 
-extension LLVM.FloatingPointPredicate {
-  public init(_ p: Core.FloatingPointPredicate) {
-    self = LLVM.FloatingPointPredicate(rawValue: p.rawValue)!
+extension SwiftyLLVM.FloatingPointPredicate {
+  public init(_ p: FrontEnd.FloatingPointPredicate) {
+    self = SwiftyLLVM.FloatingPointPredicate(rawValue: p.rawValue)!
   }
 }
