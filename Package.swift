@@ -51,7 +51,7 @@ let package = Package(
       from: "1.2.0"),
     .package(
       url: "https://github.com/attaswift/BigInt.git",
-      from: "5.3.0"),
+      from: "5.4.0"),
     .package(
       url: "https://github.com/hylo-lang/Swifty-LLVM",
       branch: "main"),
