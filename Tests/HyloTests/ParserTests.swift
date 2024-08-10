@@ -20,7 +20,7 @@ final class ParserTests: XCTestCase {
 
     var a = AST()
     try checkNoDiagnostic { d in
-      _ = try a.makeModule("Main", sourceCode: [input], diagnostics: &d)
+      _ = try a.loadModule("Main", parsing: [input], reportingDiagnosticsTo: &d)
     }
   }
 
@@ -39,7 +39,7 @@ final class ParserTests: XCTestCase {
 
     var a = AST()
     let m = try checkNoDiagnostic { d in
-      try a.makeModule("Main", sourceCode: [input], diagnostics: &d)
+      try a.loadModule("Main", parsing: [input], reportingDiagnosticsTo: &d)
     }
     XCTAssertEqual(a[a[m].sources.first!].decls.count, 4)
   }
@@ -1710,10 +1710,12 @@ final class ParserTests: XCTestCase {
     XCTAssertEqual(stmt.condition, .operatingSystem("macOs"))
     XCTAssertEqual(stmt.stmts.count, 1)
     XCTAssertEqual(stmt.fallback.count, 1)
+    
     let stmt2 = try XCTUnwrap(ast[stmt.fallback[0]] as? ConditionalCompilationStmt)
     XCTAssertEqual(stmt2.condition, .operatingSystem("Linux"))
     XCTAssertEqual(stmt2.stmts.count, 1)
     XCTAssertEqual(stmt2.fallback.count, 1)
+    
     let stmt3 = try XCTUnwrap(ast[stmt2.fallback[0]] as? ConditionalCompilationStmt)
     XCTAssertEqual(stmt3.condition, .operatingSystem("Windows"))
     XCTAssertEqual(stmt3.stmts.count, 1)
@@ -1728,14 +1730,17 @@ final class ParserTests: XCTestCase {
     XCTAssertEqual(stmt.condition, .architecture("x86_64"))
     XCTAssertEqual(stmt.stmts.count, 1)
     XCTAssertEqual(stmt.fallback.count, 1)
+    
     let stmt2 = try XCTUnwrap(ast[stmt.fallback[0]] as? ConditionalCompilationStmt)
     XCTAssertEqual(stmt2.condition, .architecture("i386"))
     XCTAssertEqual(stmt2.stmts.count, 1)
     XCTAssertEqual(stmt2.fallback.count, 1)
+    
     let stmt3 = try XCTUnwrap(ast[stmt2.fallback[0]] as? ConditionalCompilationStmt)
     XCTAssertEqual(stmt3.condition, .architecture("arm64"))
     XCTAssertEqual(stmt3.stmts.count, 1)
     XCTAssertEqual(stmt3.fallback.count, 1)
+    
     let stmt4 = try XCTUnwrap(ast[stmt3.fallback[0]] as? ConditionalCompilationStmt)
     XCTAssertEqual(stmt4.condition, .architecture("arm"))
     XCTAssertEqual(stmt4.stmts.count, 1)
@@ -1851,6 +1856,7 @@ final class ParserTests: XCTestCase {
       .hyloVersion(comparison: .less(SemanticVersion(major: 0, minor: 1, patch: 0))))
     XCTAssertEqual(stmt.stmts.count, 0)  // Body not parsed
     XCTAssertEqual(stmt.fallback.count, 1)
+    
     let stmt2 = try XCTUnwrap(ast[stmt.fallback[0]] as? ConditionalCompilationStmt)
     XCTAssertEqual(stmt2.condition, .operatingSystem("bla"))
     XCTAssertEqual(stmt2.stmts.count, 0)
@@ -1890,6 +1896,7 @@ final class ParserTests: XCTestCase {
       // all good
     }
   }
+
   func testConditionalControlNotOperatorOnFalse() throws {
     let input: SourceFile = "#if !os(abracadabra) foo() #endif"
     let (stmtID, ast) = try apply(Parser.stmt, on: input)
@@ -1905,6 +1912,7 @@ final class ParserTests: XCTestCase {
     // We should expand to nothing.
     XCTAssertEqual(stmt.expansion(for: ConditionalCompilationFactors()).count, 0)
   }
+
   func testConditionalControlNotNot() throws {
     let input: SourceFile = "#if ! !true foo() #endif"
     let (stmtID, ast) = try apply(Parser.stmt, on: input)
@@ -1912,6 +1920,7 @@ final class ParserTests: XCTestCase {
     // We should expand to the body.
     XCTAssertEqual(stmt.expansion(for: ConditionalCompilationFactors()).count, 1)
   }
+
   func testConditionalControlSkipParsingAfterNot() throws {
     let input: SourceFile = "#if !compiler_version(< 0.1) foo() #else <won't parse> #endif"
     let (stmtID, ast) = try apply(Parser.stmt, on: input)
@@ -1920,12 +1929,31 @@ final class ParserTests: XCTestCase {
     XCTAssertEqual(stmt.fallback.count, 0)  // don't parse the #else part
   }
 
+  func testConditionalControlInfix() throws {
+    let input = SourceFile.diagnosableLiteral(
+      """
+      #if os(macOS) || os(Linux) && hylo_version(< 1.0.0) || os(Windows)
+      do_something()
+      #endif
+      """)
+    let (stmtID, ast) = try apply(Parser.stmt, on: input)
+    let stmt = try XCTUnwrap(ast[stmtID] as? ConditionalCompilationStmt)
+    XCTAssertEqual(
+      stmt.condition,
+      .or(
+        .or(
+          .operatingSystem("macOS"),
+          .and(
+            .operatingSystem("Linux"),
+            .hyloVersion(comparison: .less(SemanticVersion(major: 1, minor: 0, patch: 0))))),
+        .operatingSystem("Windows")))
+  }
+
   // MARK: Operators
 
   func testTakeOperator() throws {
     let input: SourceFile = "+ & == | < <= > >="
-    var context = ParserState(
-      ast: AST(), lexer: Lexer(tokenizing: input))
+    var context = ParserState(ast: AST(), space: 0, lexer: Lexer(tokenizing: input))
     XCTAssertEqual(context.takeOperator()?.value, "+")
     XCTAssertEqual(context.takeOperator()?.value, "&")
     XCTAssertEqual(context.takeOperator()?.value, "==")
@@ -1979,13 +2007,14 @@ extension SourceFile {
     inContext context: ParserState.Context? = nil,
     with parser: (inout ParserState) throws -> Element
   ) rethrows -> (element: Element, ast: AST) {
-    var state = ParserState(ast: AST(), lexer: Lexer(tokenizing: self))
+    var tree = AST()
+    let k = tree.createNodeSpace()
+    var s = ParserState(ast: tree, space: k, lexer: Lexer(tokenizing: self))
     if let c = context {
-      state.contexts.append(c)
+      s.contexts.append(c)
     }
-
-    let element = try parser(&state)
-    return (element, state.ast)
+    let element = try parser(&s)
+    return (element, s.ast)
   }
 
   /// Parses `self` with `parser`, optionally setting `context` in the parser state.
