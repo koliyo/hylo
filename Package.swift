@@ -31,6 +31,7 @@ let package = Package(
   products: [
     .executable(name: "hc", targets: ["hc"]),
     .executable(name: "hylo-demangle", targets: ["hylo-demangle"]),
+    .executable(name: "hylo-async-crash", targets: ["hylo-async-crash"]),
     .library(name: "FrontEnd", targets: ["FrontEnd"]),
   ],
 
@@ -75,6 +76,12 @@ let package = Package(
       name: "hylo-demangle",
       dependencies: [
         "IR"
+      ],
+      swiftSettings: allTargetsSwiftSettings),
+    .executableTarget(
+      name: "hylo-async-crash",
+      dependencies: [
+        "Driver"
       ],
       swiftSettings: allTargetsSwiftSettings),
 
