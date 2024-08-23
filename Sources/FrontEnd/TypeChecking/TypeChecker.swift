@@ -79,6 +79,8 @@ struct TypeChecker {
     if t[.isCanonical] { return t }
 
     switch t.base {
+    case let u as AssociatedTypeType:
+      return canonical(u, in: scopeOfUse)
     case let u as BoundGenericType:
       return canonical(u, in: scopeOfUse)
     case let u as TypeAliasType:
@@ -87,6 +89,15 @@ struct TypeChecker {
       return canonical(u, in: scopeOfUse)
     default:
       return t.transformParts(mutating: &self, { .stepOver($0.canonical($1, in: scopeOfUse)) })
+    }
+  }
+
+  /// Returns the canonical form of `t` in `scopeOfUse`.
+  private mutating func canonical(_ t: AssociatedTypeType, in scopeOfUse: AnyScopeID) -> AnyType {
+    if let u = demandImplementation(of: t.decl, for: t.domain, in: scopeOfUse) {
+      return canonical(u, in: scopeOfUse)
+    } else {
+      return .error
     }
   }
 
@@ -595,15 +606,18 @@ struct TypeChecker {
     return result
   }
 
-  /// Returns the type implementing requirement `r` for the model `m` in `scopeOfUse`, or `nil` if
-  /// `m` does not implement `r`.
+  /// Returns the type implementing `requirement` for `model` in `scopeOfUse`, or `nil` if `model`
+  /// does not implement `requirement`.
   private mutating func demandImplementation(
-    of r: AssociatedTypeDecl.ID, for m: AnyType, in scopeOfUse: AnyScopeID
+    of requirement: AssociatedTypeDecl.ID, for model: AnyType, in scopeOfUse: AnyScopeID
   ) -> AnyType? {
-    if let c = demandConformance(of: m, to: traitDeclaring(r)!, exposedTo: scopeOfUse) {
-      return demandImplementation(of: r, in: c)
+    let p = traitDeclaring(requirement)!
+    let m = canonical(model, in: scopeOfUse)
+
+    if let c = demandConformance(of: m, to: p, exposedTo: scopeOfUse) {
+      return demandImplementation(of: requirement, in: c)
     } else if m.base is GenericTypeParameterType {
-      return ^AssociatedTypeType(r, domain: m, ast: program.ast)
+      return ^AssociatedTypeType(requirement, domain: m, ast: program.ast)
     } else {
       return nil
     }
@@ -2745,17 +2759,6 @@ struct TypeChecker {
     return (e, i)
   }
 
-  /// Computes and returns the type of `d`.
-  ///
-  /// - Requires: `d` has a type annotation.
-  private mutating func uncheckedInputType(of d: ParameterDecl.ID) -> CallableTypeParameter {
-    .init(
-      label: program[d].label?.value,
-      type: uncheckedType(of: d, ignoringSharedCache: true),
-      hasDefault: program[d].defaultValue != nil,
-      isImplicit: program[d].isImplicit)
-  }
-
   /// Computes and returns the types of the inputs `ps` of `d`.
   ///
   /// - Requires: The parameters in `ps` have type annotations.
@@ -4431,9 +4434,16 @@ struct TypeChecker {
     // `X` from the resolution of the qualification and `Y` from the resolution of the candidate.
     entityType = specialize(entityType, for: specialization, in: scopeOfUse)
 
+    // If `d` is a trait requirement, we have to remember the generic arguments that are part of
+    // its qualification in case its implementation is synthesized. Otherwise, we should only
+    // remember arguments to parameters that are in `d`'s scope.
     var capturedArguments = GenericArguments.empty
-    for p in capturedGenericParameter(of: d) {
-      capturedArguments[p] = specialization[p]
+    if program.isRequirement(d) {
+      capturedArguments = specialization
+    } else {
+      for p in capturedGenericParameter(of: d) {
+        capturedArguments[p] = specialization[p]
+      }
     }
 
     return (entityType, capturedArguments, isConstructor)
@@ -6179,26 +6189,6 @@ struct TypeChecker {
 
     report(solution.diagnostics.elements)
     assert(solution.isSound || diagnostics.containsError, "inference failed without diagnostics")
-  }
-
-  /// Commits `r` in the program, where `r` is the name resolution result for a name component
-  /// used in a type expression, returning the type of that component.
-  ///
-  /// - Precondition: `r` has a single candidate.
-  private mutating func bindTypeAnnotation(
-    _ r: NameResolutionResult.ResolvedComponent
-  ) -> AnyType {
-    let c = r.candidates.uniqueElement!
-    cache.write(c.reference, at: \.referredDecl[r.component], ignoringSharedCache: true)
-
-    let t: AnyType
-    if isBoundToNominalTypeDecl(c.reference) {
-      t = MetatypeType(c.type)!.instance
-    } else {
-      t = c.type
-    }
-    cache.write(t, at: \.exprType[r.component], ignoringSharedCache: true)
-    return t
   }
 
   /// Calls `action` on `self`, logging a trace of constraint solving iff `shouldTraceInference(n)`
