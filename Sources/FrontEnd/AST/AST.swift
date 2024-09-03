@@ -189,6 +189,25 @@ public struct AST {
   /// Indicates whether the Core library has been loaded.
   public var coreModuleIsLoaded: Bool { coreLibrary != nil }
 
+  /// Returns the Hylo type of an optional `t`.
+  ///
+  /// - Requires: The Core library must have been loaded.
+  public func optional(_ t: AnyType) -> UnionType {
+    let none = coreType("None")!
+    let p = self[none.decl].genericParameters[0]
+    let u = BoundGenericType(none, arguments: [p: .type(t)])
+    return UnionType([t, ^u])
+  }
+
+  /// Returns the Hylo type of an array of `t`.
+  ///
+  /// - Requires: The Core library must have been loaded.
+  public func array(_ t: AnyType) -> BoundGenericType {
+    let b = coreType("Array")!
+    let e = self[b.decl].genericParameters[0]
+    return BoundGenericType(b, arguments: [e: .type(t)])
+  }
+
   /// Returns the type named `name` defined in the core library or `nil` it does not exist.
   ///
   /// - Requires: The Core library must have been loaded.
@@ -303,7 +322,6 @@ public struct AST {
   /// Returns the kind identifying synthesized declarations of `requirement`, or `nil` if
   /// `requirement` is not synthesizable.
   public func synthesizedKind<T: DeclID>(of requirement: T) -> SynthesizedFunctionDecl.Kind? {
-    // If the requirement is defined in `Deinitializable`, it must be the deinitialization method.
     switch requirement.rawValue {
     case core.deinitializable.deinitialize.rawValue:
       return .deinitialize
@@ -313,6 +331,8 @@ public struct AST {
       return .moveAssignment
     case core.copyable.copy.rawValue:
       return .copy
+    case core.equatable.equal.rawValue:
+      return .equal
     default:
       return nil
     }
@@ -419,6 +439,10 @@ public struct AST {
 
       case NamePattern.self:
         result.append((subfield: subfield, pattern: NamePattern.ID(pattern)!))
+
+      case OptionPattern.self:
+        let n = self[OptionPattern.ID(pattern)!].name
+        result.append((subfield: subfield, pattern: n))
 
       case TuplePattern.self:
         let x = TuplePattern.ID(pattern)!

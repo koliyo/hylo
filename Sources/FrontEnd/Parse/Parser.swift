@@ -973,6 +973,7 @@ public enum Parser {
     // Synthesize the `Self` parameter of the trait.
     let selfParameterDecl = state.insert(
       GenericParameterDecl(
+        introducer: SourceRepresentable(value: .type, range: introducer.site),
         identifier: SourceRepresentable(value: "Self", range: name.site),
         site: name.site))
     members.append(AnyDeclID(selfParameterDecl))
@@ -1223,13 +1224,7 @@ public enum Parser {
   static func parseParameterDecl(in state: inout ParserState) throws -> ParameterDecl.ID? {
     guard let interface = try parseParameterInterface(in: &state) else { return nil }
 
-    let annotation: ParameterTypeExpr.ID?
-    if state.take(.colon) != nil {
-      annotation = try state.expect("type expression", using: parseParameterTypeExpr(in:))
-    } else {
-      annotation = nil
-    }
-
+    let annotation = try parseAscription(in: &state, parseParameterTypeExpr(in:))
     let defaultValue = try parseDefaultValue(in: &state)
 
     let isImplicit = interface.implicitMarker != nil
@@ -1331,19 +1326,44 @@ public enum Parser {
     (genericParameter.and(zeroOrMany(take(.comma).and(genericParameter).second))
       .map({ (_, tree) -> [GenericParameterDecl.ID] in [tree.0] + tree.1 }))
 
-  static let genericParameter =
-    (maybe(typeAttribute).andCollapsingSoftFailures(take(.name))
-      .and(maybe(take(.colon).and(boundComposition)))
-      .and(maybe(take(.assign).and(expr)))
-      .map({ (state, tree) -> GenericParameterDecl.ID in
-        state.insert(
-          GenericParameterDecl(
-            identifier: state.token(tree.0.0.1),
-            conformances: tree.0.1?.1 ?? [],
-            defaultValue: tree.1?.1,
-            site: state.range(
-              from: tree.0.0.0?.site.startIndex ?? tree.0.0.1.site.startIndex)))
-      }))
+  static let genericParameter = Apply(parseGenericParameterDecl(in:))
+
+  private static func parseGenericParameterDecl(
+    in state: inout ParserState
+  ) throws -> GenericParameterDecl.ID? {
+    let i = parseGenericParameterIntroducer(in: &state)
+
+    guard let n = state.take(.name) else {
+      if i == nil {
+        return nil
+      } else {
+        try fail(.error(expected: "identifier", at: state.currentLocation))
+      }
+    }
+
+    let a = try parseAscription(in: &state, boundComposition.parse(_:))
+    let v = try parseDefaultValue(in: &state)
+
+    return state.insert(
+      GenericParameterDecl(
+        introducer: i,
+        identifier: state.token(n),
+        conformances: a ?? [],
+        defaultValue: v,
+        site: (i?.site ?? n.site).extended(upTo: state.currentIndex)))
+  }
+
+  private static func parseGenericParameterIntroducer(
+    in state: inout ParserState
+  ) -> SourceRepresentable<GenericParameterDecl.Introducer>? {
+    (state.take(.type) ?? state.take(nameTokenWithValue: "value")).map { (t) in
+      if t.kind == .type {
+        return .init(value: .type, range: t.site)
+      } else {
+        return .init(value: .value, range: t.site)
+      }
+    }
+  }
 
   static let conformanceList =
     (take(.colon).and(nameTypeExpr).and(zeroOrMany(take(.comma).and(nameTypeExpr).second))
@@ -1353,6 +1373,17 @@ public enum Parser {
   private static func parseDefaultValue(in state: inout ParserState) throws -> AnyExprID? {
     if state.take(.assign) != nil {
       return try state.expect("expression", using: parseExpr(in:))
+    } else {
+      return nil
+    }
+  }
+
+  /// Parses a colon and returns the result of `ascription` applied on `state`.
+  private static func parseAscription<T>(
+    in state: inout ParserState, _ ascription: (inout ParserState) throws -> T?
+  ) throws -> T? {
+    if state.take(.colon) != nil {
+      return try state.expect("type expression", using: ascription)
     } else {
       return nil
     }
@@ -2579,10 +2610,16 @@ public enum Parser {
       return AnyPatternID(p)
     }
 
-    // Attempt to parse a name pattern if we're in the context of a binding pattern.
+    // Attempt to parse a name or option pattern if we're in the context of a binding pattern.
     if state.contexts.last == .bindingPattern {
       if let p = try namePattern.parse(&state) {
-        return AnyPatternID(p)
+        if let mark = state.takePostfixQuestionMark() {
+          let s = state.ast[p].site.extended(toCover: mark.site)
+          let o = state.insert(OptionPattern(name: p, site: s))
+          return AnyPatternID(o)
+        } else {
+          return AnyPatternID(p)
+        }
       }
     }
 
@@ -2603,16 +2640,9 @@ public enum Parser {
     state.contexts.append(.bindingPattern)
     defer { state.contexts.removeLast() }
 
-    // Parse the subpattern.
+    // Parse the subpattern and its optional ascription.
     let subpattern = try state.expect("pattern", using: parsePattern(in:))
-
-    // Parse the type annotation, if any.
-    let annotation: AnyExprID?
-    if state.take(.colon) != nil {
-      annotation = try state.expect("type expression", using: parseExpr(in:))
-    } else {
-      annotation = nil
-    }
+    let annotation = try parseAscription(in: &state, parseExpr(in:))
 
     return state.insert(
       BindingPattern(
@@ -2928,29 +2958,14 @@ public enum Parser {
       try fail(.error("conditional binding requires an initializer", at: state.ast[d].site))
     }
 
-    let fallback = try state.expect("fallback", using: conditionalBindingFallback)
+    let fallback = try state.expect("fallback", using: braceStmt.parse)
     let s = state.insert(
-      CondBindingStmt(
+      ConditionalBindingStmt(
         binding: d,
         fallback: fallback,
         site: state.ast[d].site.extended(upTo: state.currentIndex)))
     return AnyStmtID(s)
   }
-
-  static let conditionalBindingFallback =
-    (conditionalBindingFallbackStmt.or(conditionalBindingFallbackExpr))
-
-  static let conditionalBindingFallbackExpr =
-    (expr.map({ (_, id) -> CondBindingStmt.Fallback in .expr(id) }))
-
-  static let conditionalBindingFallbackStmt =
-    (oneOf([
-      anyStmt(breakStmt),
-      anyStmt(continueStmt),
-      anyStmt(returnStmt),
-      anyStmt(braceStmt),
-    ])
-    .map({ (_, id) -> CondBindingStmt.Fallback in .exit(id) }))
 
   static let declStmt =
     (Apply(parseDecl)
@@ -3411,8 +3426,6 @@ public enum Parser {
 
     return nil
   }
-
-  static let typeAttribute = attribute("@type")
 
   static let valueAttribute = attribute("@value")
 

@@ -162,9 +162,19 @@ public struct TypedProgram {
     self.base = base
   }
 
+  /// Returns the canonical form of `d`'s type.
+  public func canonical<T: DeclID>(typeOf d: T) -> AnyType {
+    canonical(declType[d]!, in: nodeToScope[d]!)
+  }
+
+  /// Returns the canonical form of `e`'s type.
+  public func canonical<T: ExprID>(typeOf e: T) -> AnyType {
+    canonical(exprType[e]!, in: nodeToScope[e]!)
+  }
+
   /// Returns the canonical form of `t` in `scopeOfUse`.
   public func canonical(_ t: AnyType, in scopeOfUse: AnyScopeID) -> AnyType {
-    if t[.isCanonical] { return t }
+    if t.isCanonical { return t }
     var checker = TypeChecker(asContextFor: self)
     return checker.canonical(t, in: scopeOfUse)
   }
@@ -296,15 +306,18 @@ public struct TypedProgram {
   /// Returns the names and types of `t`'s stored properties.
   public func storage(of t: BoundGenericType) -> [TupleType.Element] {
     storage(of: t.base).map { (p) in
+      // FIXME: Probably wrong to specialize/canonicalize in any random scope.
+      let arbitraryScope = AnyScopeID(base.ast.coreLibrary!)
       let z = GenericArguments(t)
-      let t = specialize(p.type, for: z, in: AnyScopeID(base.ast.coreLibrary!))
-      return .init(label: p.label, type: t)
+      let u = specialize(p.type, for: z, in: arbitraryScope)
+      let v = canonical(u, in: arbitraryScope)
+      return .init(label: p.label, type: v)
     }
   }
 
   /// Returns the names and types of `t`'s stored properties.
   public func storage(of t: BufferType) -> [TupleType.Element] {
-    if let w = t.count.asCompilerKnown(Int.self) {
+    if let w = ConcreteTerm(t.count)?.value as? Int {
       return Array(repeating: .init(label: nil, type: t.element), count: w)
     } else {
       return []
@@ -431,7 +444,7 @@ public struct TypedProgram {
   private func structuralConformance(
     of model: AnyType, to concept: TraitType, exposedTo scopeOfUse: AnyScopeID
   ) -> Conformance? {
-    assert(model[.isCanonical])
+    assert(model.isCanonical)
 
     switch model.base {
     case let m as BufferType:
