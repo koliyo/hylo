@@ -837,6 +837,22 @@ final class ParserTests: XCTestCase {
     XCTAssertEqual(decl.baseName, "T")
   }
 
+  func testGenericParameterWithTypeIntroducer() throws {
+    let input: SourceFile = "type T"
+    let (d, a) = try apply(Parser.genericParameter, on: input)
+    let n = try XCTUnwrap(a[d])
+    XCTAssertEqual(n.baseName, "T")
+    XCTAssertEqual(n.introducer?.value, .type)
+  }
+
+  func testGenericParameterWithValueIntroducer() throws {
+    let input: SourceFile = "value T"
+    let (d, a) = try apply(Parser.genericParameter, on: input)
+    let n = try XCTUnwrap(a[d])
+    XCTAssertEqual(n.baseName, "T")
+    XCTAssertEqual(n.introducer?.value, .value)
+  }
+
   func testGenericParameterWithConformances() throws {
     let input: SourceFile = "T: Foo & Bar"
     let (declID, ast) = try apply(Parser.genericParameter, on: input)
@@ -1442,16 +1458,6 @@ final class ParserTests: XCTestCase {
     }
   }
 
-  // func testWhereClauseValueConstraintSansHint() throws {
-  //   let input: SourceFile = "x > 2"
-  //   let constraint = try XCTUnwrap(try apply(Parser.valueConstraint, on: input).element)
-  //   if case .value(let exprID) = constraint.value {
-  //     XCTAssertEqual(exprID.kind, .init(SequenceExpr.self))
-  //   } else {
-  //     XCTFail()
-  //   }
-  // }
-
   func testBoundComposition() throws {
     let input: SourceFile = "T & U & V"
     let list = try XCTUnwrap(try apply(Parser.boundComposition, on: input).element)
@@ -1502,6 +1508,14 @@ final class ParserTests: XCTestCase {
     let (patternID, ast) = try apply(Parser.namePattern, on: input)
     let pattern = try XCTUnwrap(ast[patternID])
     XCTAssertEqual(ast[pattern.decl].baseName, "foo")
+  }
+
+  func testOptionPattern() throws {
+    let input: SourceFile = "let foo?"
+    let (p, ast) = try input.parse(with: Parser.parseBindingPattern(in:))
+    let b = try XCTUnwrap(p)
+    let o = try XCTUnwrap(OptionPattern.ID(ast[b].subpattern))
+    XCTAssertEqual(ast[ast[ast[o].name].decl].baseName, "foo")
   }
 
   func testTuplePattern() throws {
@@ -1630,39 +1644,11 @@ final class ParserTests: XCTestCase {
   }
 
   func testConditionalBinding() throws {
-    let input: SourceFile = "var x = foo() else return"
-    let (s, ast) = try apply(Parser.bindingStmt, on: input, context: .functionBody)
-    let stmt = try XCTUnwrap(ast[s.flatMap(CondBindingStmt.ID.init)])
-    if case .exit = stmt.fallback {
-    } else {
-      XCTFail()
-    }
-  }
-
-  func testConditionalBindingBlock() throws {
-    let input: SourceFile = "var x = foo() else { bar(); return }"
-    let (s, ast) = try apply(Parser.bindingStmt, on: input, context: .functionBody)
-    let stmt = try XCTUnwrap(ast[s.flatMap(CondBindingStmt.ID.init)])
-    if case .exit = stmt.fallback {
-    } else {
-      XCTFail()
-    }
-  }
-
-  func testConditionalBindingExpr() throws {
-    let input: SourceFile = "var x = foo() else fatal_error()"
-    let (s, ast) = try apply(Parser.bindingStmt, on: input, context: .functionBody)
-    let stmt = try XCTUnwrap(ast[s.flatMap(CondBindingStmt.ID.init)])
-    if case .expr = stmt.fallback {
-    } else {
-      XCTFail()
-    }
-  }
-
-  func testConditionalBindingFallback() throws {
-    let input: SourceFile = "return"
-    XCTAssertNotNil(
-      try apply(Parser.conditionalBindingFallbackStmt, on: input, context: .functionBody))
+    let input: SourceFile = "var x = foo() else { return }"
+    let (s, a) = try apply(Parser.bindingStmt, on: input, context: .functionBody)
+    let n = try XCTUnwrap(a[s.flatMap(ConditionalBindingStmt.ID.init(_:))])
+    let m = try XCTUnwrap(a[n.fallback].stmts.first)
+    XCTAssert(m.kind == ReturnStmt.self)
   }
 
   func testDeclStmt() throws {

@@ -494,7 +494,7 @@ struct Emitter {
     precondition(program.isGlobal(d))
     precondition(read(program[d].pattern.introducer.value, { ($0 == .let) || ($0 == .sinklet) }))
 
-    let r = RemoteType(.set, program[d].type)
+    let r = RemoteType(.set, program.canonical(typeOf: d))
     let l = ArrowType(
       receiverEffect: .set, environment: ^TupleType(types: [^r]), inputs: [], output: .void)
     let f = SynthesizedFunctionDecl(
@@ -612,30 +612,27 @@ struct Emitter {
   ///
   /// - Requires: `d` is a local `let` or `inout` binding.
   private mutating func lower(projectedLocalBinding d: BindingDecl.ID) {
-    let access = AccessEffect(program[d].pattern.introducer.value)
-    precondition(access == .let || access == .inout)
     precondition(program.isLocal(d))
+    let source = emitLValue(ast[d].initializer!)
+    assignProjections(of: source, to: program[d].pattern)
+  }
 
-    let initializer = ast[d].initializer!
-    let source = emitLValue(initializer)
-    let isSink = module.isSink(source)
+  /// Assigns the bindings declared in `d` to their corresponding projection of `rhs`.
+  private mutating func assignProjections(of rhs: Operand, to d: BindingPattern.ID) {
+    precondition(!program[d].introducer.value.isConsuming)
+    let k = AccessEffect(program[d].introducer.value)
+    let request: AccessEffectSet = module.isSink(rhs) ? [k, .sink] : [k]
 
-    for (path, name) in ast.names(in: program[d].pattern.subpattern) {
-      var part = emitSubfieldView(source, at: path, at: program[name].decl.site)
+    for (path, name) in ast.names(in: program[d].subpattern) {
+      var part = emitSubfieldView(rhs, at: path, at: program[name].decl.site)
       let partDecl = ast[name].decl
 
-      let t = canonical(program[partDecl].type)
-      part = emitCoerce(part, to: t, at: ast[partDecl].site)
+      let bindingType = canonical(program[partDecl].type)
+      part = emitCoerce(part, to: bindingType, at: ast[partDecl].site)
 
-      if isSink {
-        let b = module.makeAccess(
-          [.sink, access], from: part, correspondingTo: partDecl, at: ast[partDecl].site)
-        frames[partDecl] = insert(b)!
-      } else {
-        let b = module.makeAccess(
-          access, from: part, correspondingTo: partDecl, at: ast[partDecl].site)
-        frames[partDecl] = insert(b)!
-      }
+      let b = module.makeAccess(
+        request, from: part, correspondingTo: partDecl, at: ast[partDecl].site)
+      frames[partDecl] = insert(b)!
     }
   }
 
@@ -740,7 +737,7 @@ struct Emitter {
     let targets = UnionSwitch.Targets(
       t.elements.map({ (e) in (key: e, value: appendBlock()) }),
       uniquingKeysWith: { (a, _) in a })
-    insert(module.makeUnionSwitch(on: receiver, toOneOf: targets, at: site))
+    emitUnionSwitch(on: argument, toOneOf: targets, at: site)
 
     let tail = appendBlock()
     for (u, b) in targets {
@@ -760,12 +757,9 @@ struct Emitter {
     of receiver: Operand, consuming argument: Operand, containing payload: AnyType,
     at site: SourceRange
   ) {
-    // Deinitialize the receiver.
+    // Move the argument.
     let x0 = insert(
       module.makeOpenUnion(receiver, as: payload, forInitialization: true, at: site))!
-    emitDeinit(x0, at: site)
-
-    // Move the argument.
     let x1 = insert(module.makeOpenUnion(argument, as: payload, at: site))!
     emitMove([.set], x1, to: x0, at: site)
 
@@ -896,7 +890,7 @@ struct Emitter {
     let targets = UnionSwitch.Targets(
       t.elements.map({ (e) in (key: e, value: appendBlock()) }),
       uniquingKeysWith: { (a, _) in a })
-    insert(module.makeUnionSwitch(on: source, toOneOf: targets, at: site))
+    emitUnionSwitch(on: source, toOneOf: targets, at: site)
 
     let tail = appendBlock()
     for (u, b) in targets {
@@ -1027,6 +1021,8 @@ struct Emitter {
       return emit(braceStmt: .init(s)!)
     case BreakStmt.self:
       return emit(breakStmt: .init(s)!)
+    case ConditionalBindingStmt.self:
+      return emit(conditionalBindingStmt: .init(s)!)
     case ConditionalCompilationStmt.self:
       return emit(condCompilationStmt: .init(s)!)
     case ConditionalStmt.self:
@@ -1102,6 +1098,25 @@ struct Emitter {
 
   private mutating func emit(condCompilationStmt s: ConditionalCompilationStmt.ID) -> ControlFlow {
     emit(stmtList: ast[s].expansion(for: ast.compilationConditions))
+  }
+
+  private mutating func emit(conditionalBindingStmt s: ConditionalBindingStmt.ID) -> ControlFlow {
+    let storage = emitAllocation(binding: ast[s].binding)
+
+    let fail = appendBlock()
+    let next = emitConditionalNarrowing(
+      ast[s].binding, movingConsumedValuesTo: storage,
+      branchingOnFailureTo: fail, in: insertionScope!)
+
+    insertionPoint = .end(of: fail)
+    let flow = emit(braceStmt: ast[s].fallback)
+    emitControlFlow(flow) { (me) in
+      // Control-flow can never jump here.
+      me.insert(me.module.makeUnreachable(at: me.ast[me.ast[s].fallback].site))
+    }
+
+    insertionPoint = .end(of: next)
+    return .next
   }
 
   private mutating func emit(conditionalStmt s: ConditionalStmt.ID) -> ControlFlow {
@@ -1661,8 +1676,8 @@ struct Emitter {
       let calleeType = ArrowType(t)!.lifted
 
       // Emit the operands, starting with RHS.
-      let r = emit(infixOperand: rhs, passed: ParameterType(calleeType.inputs[1].type)!.access)
-      let l = emit(infixOperand: lhs, passed: ParameterType(calleeType.inputs[0].type)!.access)
+      let r = emit(infixOperand: rhs, passedTo: ParameterType(calleeType.inputs[1].type)!)
+      let l = emit(infixOperand: lhs, passedTo: ParameterType(calleeType.inputs[0].type)!)
 
       // The callee must be a reference to member function.
       guard case .member(let d, let a, _) = program[callee.expr].referredDecl else {
@@ -2073,24 +2088,21 @@ struct Emitter {
     return (callee, captures + arguments)
   }
 
-  /// Inserts the IR for infix operand `e` passed with convention `access`.
+  /// Inserts the IR for infix operand `e` passed to a parameter of type `p`.
   private mutating func emit(
-    infixOperand e: FoldedSequenceExpr, passed access: AccessEffect
+    infixOperand e: FoldedSequenceExpr, passedTo p: ParameterType
   ) -> Operand {
-    let storage: Operand
-
     switch e {
-    case .infix(let callee, _, _):
-      let t = ArrowType(canonical(program[callee.expr].type))!.lifted
-      storage = emitAllocStack(for: t.output, at: ast.site(of: e))
-      emitStore(e, to: storage)
+    case .infix(let f, _, _):
+      let t = ArrowType(canonical(program[f.expr].type))!.lifted
+      let s = emitAllocStack(for: t.output, at: ast.site(of: e))
+      emitStore(e, to: s)
+      let u = emitCoerce(s, to: p.bareType, at: ast.site(of: e))
+      return insert(module.makeAccess(p.access, from: u, at: ast.site(of: e)))!
 
     case .leaf(let e):
-      let x0 = emitLValue(e)
-      storage = unwrapCapture(x0, at: program[e].site)
+      return emitArgument(e, to: p, at: program[e].site)
     }
-
-    return insert(module.makeAccess(access, from: storage, at: ast.site(of: e)))!
   }
 
   /// Emits the IR of a call to `f` with given `arguments` at `site`.
@@ -2308,37 +2320,33 @@ struct Emitter {
     return (entityToCall, [c])
   }
 
+
   /// Returns `(success: a, failure: b)` where `a` is the basic block reached if all items in
   /// `condition` hold and `b` is the basic block reached otherwise, creating new basic blocks
   /// in `scope`.
   private mutating func emitTest(
     condition: [ConditionItem], in scope: AnyScopeID
   ) -> (success: Block.ID, failure: Block.ID) {
-    let f = insertionFunction!
-
     // Allocate storage for all the declarations in the condition before branching so that all
-    // `dealloc_stack` are to dominated by their corresponding `alloc_stack`.
-    var allocs: [Operand] = []
+    // `dealloc_stack` are dominated by their corresponding `alloc_stack`.
+    var allocations: [Operand?] = []
     for case .decl(let d) in condition {
-      let a = insert(module.makeAllocStack(program[d].type, at: ast[d].site))!
-      allocs.append(a)
+      allocations.append(emitAllocation(binding: d))
     }
 
-    let failure = module.appendBlock(in: scope, to: f)
+    let failure = module.appendBlock(in: scope, to: insertionFunction!)
     for (i, item) in condition.enumerated() {
       switch item {
       case .expr(let e):
         let test = pushing(Frame(), { $0.emit(branchCondition: e) })
-        let next = module.appendBlock(in: scope, to: f)
+        let next = appendBlock(in: scope)
         insert(module.makeCondBranch(if: test, then: next, else: failure, at: ast[e].site))
         insertionPoint = .end(of: next)
 
       case .decl(let d):
-        let subject = emitLValue(ast[d].initializer!)
-        let patternType = canonical(program[d].type)
         let next = emitConditionalNarrowing(
-          subject, as: ast[d].pattern, typed: patternType, to: allocs[i],
-          else: failure, in: scope)
+          d, movingConsumedValuesTo: allocations[i],
+          branchingOnFailureTo: failure, in: scope)
         insertionPoint = .end(of: next)
       }
     }
@@ -2346,68 +2354,75 @@ struct Emitter {
     return (success: insertionBlock!, failure: failure)
   }
 
-  /// Returns a basic block in which the names in `pattern` have been declared and initialized.
-  ///
-  /// This method emits IR to:
-  ///
-  /// - check whether the value in `subject` is an instance of `patternType`;
-  /// - if it isn't, jump to `failure`;
-  /// - if it is, jump to a new basic block *b*, coerce the contents of `subject` into `storage`,
-  ///   applying consuming coercions as necessary, and define the bindings declared in `pattern`.
-  ///
-  /// If `subject` always matches `patternType`, the narrowing is irrefutable and `failure` is
-  /// unreachable in the generated IR.
-  ///
-  /// The return value is the new basic block *b*, which is defined in `scope`. The emitter context
-  /// is updated to associate the bindings declared in `pattern` to their address in `storage`.
-  private mutating func emitConditionalNarrowing(
-    _ subject: Operand,
-    as pattern: BindingPattern.ID, typed patternType: AnyType,
-    to storage: Operand,
-    else failure: Block.ID, in scope: AnyScopeID
-  ) -> Block.ID {
-    switch module.type(of: subject).ast.base {
-    case let t as UnionType:
-      return emitConditionalNarrowing(
-        subject, typed: t, as: pattern, typed: patternType, to: storage,
-        else: failure, in: scope)
-    default:
-      break
+  /// If `d` declares stored bindings, inserts the IR for allocating their storage and returns a
+  /// a rreference to that storage. Otherwise, returns `nil`.
+  private mutating func emitAllocation(binding d: BindingDecl.ID) -> Operand? {
+    if program[d].pattern.introducer.value.isConsuming {
+      return insert(module.makeAllocStack(program[d].type, at: ast[d].site))
+    } else {
+      return nil
     }
-
-    UNIMPLEMENTED()
   }
 
-  /// Returns a basic block in which the names in `pattern` have been declared and initialized.
+  /// Returns a basic block in which the names in `d` have been declared and initialized.
   ///
-  /// This method method implements conditional narrowing for union types.
+  /// This method emits IR to:
+  /// - evaluate the `d`'s initializer as value *v*,
+  /// - check whether the value in *v* is an instance of `d`'s type;
+  /// - if it isn't, jump to `failure`;
+  /// - if it is, jump to a new basic block and define and initialize the bindings declared in `d`.
+  ///
+  /// If `d` has a consuming introducer (e.g., `var`), the value of `d`'s initializer is moved to
+  /// `storage`, which denotes a memory location with `d`'s type. Otherwise, `storage` is `nil` and
+  /// the bindings in `d` are defined as new projections. In either case, the emitter's context is
+  /// is updated to associate each binding to its value.
+  ///
+  /// The return value of the method is a basic block, defined in `scope`. If *v* has the same type
+  /// as `d`, the narrowing is irrefutable and `failure` is unreachable in the generated IR.
   private mutating func emitConditionalNarrowing(
-    _ subject: Operand, typed union: UnionType,
-    as pattern: BindingPattern.ID, typed patternType: AnyType,
-    to storage: Operand,
-    else failure: Block.ID, in scope: AnyScopeID
+    _ d: BindingDecl.ID,
+    movingConsumedValuesTo storage: Operand?,
+    branchingOnFailureTo failure: Block.ID,
+    in scope: AnyScopeID
   ) -> Block.ID {
-    // TODO: Implement narrowing to an arbitrary subtype.
-    guard union.elements.contains(patternType) else { UNIMPLEMENTED() }
-    let site = ast[pattern].site
+    let lhsType = canonical(program[d].type)
+    let rhs = emitLValue(ast[d].initializer!)
+    let lhs = ast[d].pattern
 
-    let next = appendBlock(in: scope)
-    var targets = UnionSwitch.Targets(
-      union.elements.map({ (e) in (key: e, value: failure) }),
-      uniquingKeysWith: { (a, _) in a })
-    targets[patternType] = next
+    assert(program[lhs].introducer.value.isConsuming || (storage == nil))
 
-    insert(module.makeUnionSwitch(on: subject, toOneOf: targets, at: site))
-    insertionPoint = .end(of: next)
-    let x0 = insert(module.makeOpenUnion(subject, as: patternType, at: site))!
-    pushing(Frame()) { (this) in
-      this.emitMove([.set], x0, to: storage, at: site)
+    if let rhsType = UnionType(module.type(of: rhs).ast) {
+      guard rhsType.elements.contains(lhsType) else { UNIMPLEMENTED("recursive narrowing") }
+
+      let next = appendBlock(in: scope)
+      let site = program[lhs].site
+
+      var targets = UnionSwitch.Targets(
+        rhsType.elements.map({ (e) in (key: e, value: failure) }),
+        uniquingKeysWith: { (a, _) in a })
+      targets[lhsType] = next
+      emitUnionSwitch(on: rhs, toOneOf: targets, at: site)
+
+      insertionPoint = .end(of: next)
+
+      if let target = storage {
+        let x0 = insert(module.makeAccess(.sink, from: rhs, at: site))!
+        let x1 = insert(module.makeOpenUnion(x0, as: lhsType, at: site))!
+        emitMove([.set], x1, to: target, at: site)
+        emitLocalDeclarations(introducedBy: lhs, referringTo: [], relativeTo: target)
+        insert(module.makeCloseUnion(x1, at: site))
+        insert(module.makeEndAccess(x0, at: site))
+      } else {
+        let k = AccessEffect(program[lhs].introducer.value)
+        let x0 = insert(module.makeAccess(k, from: rhs, at: site))!
+        let x1 = insert(module.makeOpenUnion(x0, as: lhsType, at: site))!
+        assignProjections(of: x1, to: program[d].pattern)
+      }
+
+      return next
+    } else {
+      UNIMPLEMENTED()
     }
-    insert(module.makeCloseUnion(x0, at: site))
-
-    emitLocalDeclarations(introducedBy: pattern, referringTo: [], relativeTo: storage)
-
-    return next
   }
 
   /// Inserts the IR for branch condition `e`.
@@ -3077,7 +3092,7 @@ struct Emitter {
     let targets = UnionSwitch.Targets(
       t.elements.map({ (e) in (key: e, value: appendBlock()) }),
       uniquingKeysWith: { (a, _) in a })
-    insert(module.makeUnionSwitch(on: storage, toOneOf: targets, at: site))
+    emitUnionSwitch(on: storage, toOneOf: targets, at: site)
 
     let tail = appendBlock()
     for (u, b) in targets {
@@ -3187,7 +3202,7 @@ struct Emitter {
     insert(module.makeCondBranch(if: x0, then: same, else: fail, at: site))
 
     insertionPoint = .end(of: same)
-    insert(module.makeUnionSwitch(on: lhs, toOneOf: targets, at: site))
+    emitUnionSwitch(on: lhs, toOneOf: targets, at: site)
     for (u, b) in targets {
       insertionPoint = .end(of: b)
       let y0 = insert(module.makeOpenUnion(lhs, as: u, at: site))!
@@ -3297,6 +3312,16 @@ struct Emitter {
     let x1 = insert(module.makeUnionDiscriminator(x0, at: site))!
     insert(module.makeEndAccess(x0, at: site))
     return x1
+  }
+
+  /// Appends the IR for jumping to the block assigned to the type of `scrutinee`'s payload in
+  /// `targets`.
+  private mutating func emitUnionSwitch(
+    on scrutinee: Operand, toOneOf targets: UnionSwitch.Targets, at site: SourceRange
+  ) {
+    let u = UnionType(module.type(of: scrutinee).ast)!
+    let i = emitUnionDiscriminator(scrutinee, at: site)
+    insert(module.makeUnionSwitch(over: i, of: u, toOneOf: targets, at: site))
   }
 
   /// Returns the result of calling `action` on a copy of `self` in which a `newFrame` is the top
