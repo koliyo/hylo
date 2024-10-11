@@ -65,7 +65,8 @@ public struct TypedProgram {
     inParallel typeCheckingIsParallel: Bool = false,
     reportingDiagnosticsTo log: inout DiagnosticSet,
     throwOnError: Bool = true,
-    tracingInferenceIf shouldTraceInference: ((AnyNodeID, TypedProgram) -> Bool)? = nil
+    tracingInferenceIf shouldTraceInference: ((AnyNodeID, TypedProgram) -> Bool)? = nil,
+    loggingRequirementSystemIf shouldLogRequirements: ((AnyDeclID, TypedProgram) -> Bool)? = nil
   ) throws {
     let instanceUnderConstruction = SharedMutable(TypedProgram(partiallyFormedFrom: base))
 
@@ -77,7 +78,8 @@ public struct TypedProgram {
         let t = TypeCheckTask(
           Array(chunk), withCheckerIdentifiedBy: UInt8(i),
           collaborativelyConstructing: instanceUnderConstruction,
-          tracingInferenceIf: nil)
+          tracingInferenceIf: nil,
+          loggingRequirementSystemIf: nil)
         tasks.append(t)
       }
 
@@ -91,7 +93,8 @@ public struct TypedProgram {
     self = try instanceUnderConstruction.read {
       var checker = TypeChecker(
         constructing: $0,
-        tracingInferenceIf: typeCheckingIsParallel ? nil : shouldTraceInference)
+        tracingInferenceIf: typeCheckingIsParallel ? nil : shouldTraceInference,
+        loggingRequirementSystemIf: typeCheckingIsParallel ? nil : shouldLogRequirements)
       checker.checkAllDeclarations()
 
       log.formUnion(checker.diagnostics)
@@ -111,13 +114,17 @@ public struct TypedProgram {
   public func loadModule(
     reportingDiagnosticsTo log: inout DiagnosticSet,
     tracingInferenceIf shouldTraceInference: ((AnyNodeID, TypedProgram) -> Bool)? = nil,
+    loggingRequirementSystemIf shouldLogRequirements: ((AnyDeclID, TypedProgram) -> Bool)? = nil,
     creatingContentsWith make: AST.ModuleLoader
   ) throws -> (Self, ModuleDecl.ID) {
     let (p, m) = try base.loadModule(reportingDiagnosticsTo: &log, creatingContentsWith: make)
     var extended = self
     extended.base = consume p
 
-    var checker = TypeChecker(constructing: extended, tracingInferenceIf: shouldTraceInference)
+    var checker = TypeChecker(
+      constructing: extended,
+      tracingInferenceIf: shouldTraceInference,
+      loggingRequirementSystemIf: shouldLogRequirements)
     checker.checkModule(m)
 
     log.formUnion(checker.diagnostics)
@@ -140,12 +147,15 @@ public struct TypedProgram {
       _ sources: [TranslationUnit.ID],
       withCheckerIdentifiedBy checkerIdentifier: UInt8,
       collaborativelyConstructing instanceUnderConstruction: SharedMutable<TypedProgram>,
-      tracingInferenceIf shouldTraceInference: ((AnyNodeID, TypedProgram) -> Bool)?
+      tracingInferenceIf shouldTraceInference: ((AnyNodeID, TypedProgram) -> Bool)?,
+      loggingRequirementSystemIf shouldLogRequirements: ((AnyDeclID, TypedProgram) -> Bool)?
     ) {
       self.sources = sources
       self.checker = TypeChecker(
-        checkerIdentifier, collaborativelyConstructing: instanceUnderConstruction,
-        tracingInferenceIf: shouldTraceInference)
+        checkerIdentifier,
+        collaborativelyConstructing: instanceUnderConstruction,
+        tracingInferenceIf: shouldTraceInference,
+        loggingRequirementSystemIf: shouldLogRequirements)
     }
 
     /// Executes the operation.
@@ -496,7 +506,8 @@ public struct TypedProgram {
   /// - Requires: `n` is declared by the trait for which `c` has been established.
   public func associatedType(_ n: AssociatedTypeDecl.ID, for c: Conformance) -> AnyType {
     let d = c.implementations[n]!.decl!
-    let t = specialize(MetatypeType(declType[d]!)!.instance, for: c.arguments, in: c.scope)
+    let s: AnyScopeID = c.origin.flatMap({ (o) in AnyScopeID(o.source) }) ?? c.scope
+    let t = specialize(MetatypeType(declType[d]!)!.instance, for: c.arguments, in: s)
     return canonical(t, in: c.scope)
   }
 
