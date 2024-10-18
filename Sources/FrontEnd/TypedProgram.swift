@@ -133,7 +133,7 @@ public struct TypedProgram {
   }
 
   /// The type checking of a collection of source files.
-  private final class TypeCheckTask: Operation {
+  private final class TypeCheckTask: Operation, @unchecked Sendable {
 
     /// The sources to check.
     private let sources: [TranslationUnit.ID]
